@@ -18,6 +18,8 @@ import sys
 import threading
 import random
 import socket
+import os
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from requests.adapters import HTTPAdapter
@@ -94,7 +96,7 @@ def pdp_get_ipv4(session, url, **kwargs):
 # ── CONFIG ─────────────────────────────────────────────────────────────────────
 BOT_TOKEN      = "8679800339:AAH1uKwHey2l7tCyl3GPbJW0wzwCzS81I4w"
 CHAT_ID        = "1276512925"
-CHECK_INTERVAL = 1.2
+CHECK_INTERVAL = 2
 BASE_URL       = "https://sheinindia.in"
 STATE_FILE     = "shein_state.json"  # saves seen_snapshots + absent_codes between restarts
 
@@ -537,12 +539,38 @@ def load_state() -> tuple:
         print(f"[STATE] Load failed ({e}) — starting fresh.")
         return {}, set()
 
+# ── RAILWAY HEALTH CHECK SERVER ───────────────────────────────────────────────
+
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+    def log_message(self, *args):
+        pass  # suppress HTTP access logs
+
+def start_health_server():
+    """
+    Starts a minimal HTTP server on $PORT (Railway injects this env var).
+    Railway requires something to respond on that port or it marks the deploy failed.
+    Runs in a daemon thread — won't block or interfere with the monitor.
+    """
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), _HealthHandler)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    print(f"✅ Health check server listening on port {port}")
+
+
 # ── MAIN ────────────────────────────────────────────────────────────────────────
 
 def main():
     print("=" * 60)
     print("  SHEIN Men's Category Monitor  |  @CoBra_SR")
     print("=" * 60)
+
+    # Start Railway health check server first (required or deploy fails)
+    start_health_server()
 
     # Load previous state first
     seen_snapshots, absent_codes = load_state()
