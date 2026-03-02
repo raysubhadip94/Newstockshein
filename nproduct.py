@@ -131,7 +131,7 @@ LISTING_URL = (
 )
 LISTING_PARAMS = {
     "advfilter": "true", "urgencyDriverEnabled": "true",
-    "query": ":relevance:genderfilter:Men", "pageSize": 24,
+    "query": ":newArrivals:genderfilter:Men", "pageSize": 60,
     "store": "shein", "fields": "FULL", "currentPage": 0,
     "SearchExp1": "algo1", "SearchExp3": "suggester",
     "RelExp3": "false", "softFilters": "false", "stemFlag": "false",
