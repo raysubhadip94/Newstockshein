@@ -275,7 +275,8 @@ def fetch_pdp_stock(option_code: str, retries: int = 3) -> dict:
                 if retries > 1:
                     print(f"  [PDP 403] {option_code} — attempt {attempt+1}/{retries}")
                     time.sleep(attempt + 1)
-                return {}   # treat 403 as OOS for restock scan, retry loop for new products
+                    continue   # retry
+                return None   # single-attempt: 403 = skip, don't overwrite cache
 
             if resp.status_code == 429:
                 retry_after = int(resp.headers.get("Retry-After", 3))
@@ -965,12 +966,12 @@ def pdp_worker(seen_snapshots: dict, listing_map: dict):
         # ── JOB 1: drain queue first (new products take priority) ────────────────
         while not pdp_queue.empty():
             try:
-                code, product, reason, old_snap = pdp_queue.get(block=False)
+                code, product, reason, old_snap, pdp_retries = pdp_queue.get(block=False)
             except queue.Empty:
                 break
 
             try:
-                snap = fetch_pdp_stock(code)
+                snap = fetch_pdp_stock(code, retries=pdp_retries)
                 name = product.get("name", code)
 
                 with pdp_cache_lock:
@@ -989,7 +990,8 @@ def pdp_worker(seen_snapshots: dict, listing_map: dict):
                     else:
                         print(f"\n[PDP-WORKER] ⛔ Filtered: {name}")
                 elif snap is not None:
-                    print(f"\n[PDP-WORKER] ⚫ OOS confirmed: {name}")
+                    if reason != "retry":
+                        print(f"\n[PDP-WORKER] ⚫ OOS: {name}")
                 else:
                     # PDP failed — keep as None so listing loop re-queues next cycle
                     with pdp_cache_lock:
@@ -1026,9 +1028,10 @@ def pdp_worker(seen_snapshots: dict, listing_map: dict):
                 # If 403/fail, skip this product and revisit next pass.
                 new_snap = fetch_pdp_stock(code, retries=1)
 
-                # Only update cache if we got a response (even empty = OOS is valid)
-                with pdp_cache_lock:
-                    seen_snapshots[code] = new_snap
+                # Only update cache on valid response — None means 403/fail, keep old value
+                if new_snap is not None:
+                    with pdp_cache_lock:
+                        seen_snapshots[code] = new_snap
 
                 name = product.get("name", code)
 
@@ -1041,7 +1044,7 @@ def pdp_worker(seen_snapshots: dict, listing_map: dict):
                             print(f"\n[PDP-WORKER] 🔄 RESTOCK detected: {name}")
                         else:
                             print(f"\n[PDP-WORKER] ⛔ Restock filtered: {name}")
-                # No stock change or still OOS → update cache silently
+                # None = 403/fail (cache unchanged), {} = confirmed OOS (cache updated above)
 
             except Exception as e:
                 print(f"\n[PDP-WORKER ERROR] restock scan {code}: {e}")
@@ -1117,7 +1120,7 @@ def main():
     for code in needs_pdp_init:
         product = listing_map.get(code)
         if product:
-            pdp_queue.put((code, product, "retry", None))
+            pdp_queue.put((code, product, "retry", None, 1))
     if needs_pdp_init:
         print(f"  📥 Queued {len(needs_pdp_init)} PDP checks for background worker.")
 
@@ -1176,7 +1179,7 @@ def main():
             with pdp_cache_lock:
                 seen_snapshots[code] = None   # None = PDP in progress
             pdp_queued.add(code)
-            pdp_queue.put((code, product, "new", None))
+            pdp_queue.put((code, product, "new", None, 3))
             new_queued += 1
             print(f"\n[{datetime.now():%H:%M:%S}] 📥 New → PDP queued: {product.get('name', code)}")
 
@@ -1187,7 +1190,7 @@ def main():
             with pdp_cache_lock:
                 seen_snapshots[code] = None
             pdp_queued.add(code)
-            pdp_queue.put((code, product, "returned", old_snap))
+            pdp_queue.put((code, product, "returned", old_snap, 3))
             new_queued += 1
             print(f"\n[{datetime.now():%H:%M:%S}] 🔄 Returned → PDP queued: {product.get('name', code)}")
 
