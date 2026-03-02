@@ -144,8 +144,42 @@ PDP_BASE   = "https://pdpaggregator-edge.services.sheinindia.in/aggregator/pdp"
 PDP_PARAMS = {
     "storeId": "shein", "sortOptionsByColor": "true",
     "client_type": "Android/32", "client_version": "1.0.14",
-    "isNewUser": "true", "pincode": "110001",
-    "tagVersionTwo": "false", "applyExperiment ": "false", "fields": "FULL",
+    "isNewUser": "true", "pincode": "743395",   # real pincode from app traffic
+    "tagVersionTwo": "false", "applyExperiment": "true",  # fixed param name + true
+    "fields": "FULL",
+}
+PDP_HEADERS = {
+    "Accept": "application/json",
+    "User-Agent": "Android",
+    "Client_type": "Android/32",
+    "Client_version": "1.0.14",
+    "X-Tenant-Id": "SHEIN",
+    "Ad_id": "342f47d0-910f-4a29-9bd7-cadb98a2eca9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",   # from curl — reuse TCP connection
+}
+
+# ── CART API (add-to-cart stock check) ───────────────────────────────────────────
+# Faster stock check — POST to cart. Success = in stock, error = OOS.
+# Bearer token expires 2026-03-24. Cart ID is anonymous session, stable.
+CART_BASE    = "https://api.services.sheinindia.in/rilfnlwebservices/v2/rilfnl/users/anonymous/carts"
+CART_ID      = "96331ee6-ecc4-43f8-92fc-dbacf63d241b"
+CART_TOKEN   = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJjbGllbnQiLCJjbGllbnROYW1lIjoidHJ1c3RlZF9jbGllbnQiLCJyb2xlcyI6W3sibmFtZSI6IlJPTEVfVFJVU1RFRF9DTElFTlQifV0sInRlbmFudElkIjoiU0hFSU4iLCJleHAiOjE3NzQzNzM4MDMsImlhdCI6MTc3MTc4MTgwM30.Dj1UvifYKjaFLh5b6YcWJ3Ad7mP6ooTZOVVaCkw3dc6BbnoyDlB6sjRWKF1_USwhH5wr5QJpDO2PM8j_OpDqzGR01LbRseL9wzHENkvnQXhlNfnjiuQIRUxwZ4QGNSfsD6wGfcek-LuYeTSVDO4mFbSzsr6KLV-e4PzEnXALa2EczZVc5CZvNVzgxveIeUZDgT-bf5ifuN3oMGO7PrzoVRb_7AcvwNcKL-0mArKidkEUimipN_Ypkd472NayOwY8M3Z7yneetdUKhGM9-sXlxtbLAKDt8dzPvz1btFypScEuRmsoK2epdFSbKShnljgdwkKBhIQiNuQFkP8pSBqMDQ"
+CART_HEADERS = {
+    "Accept": "application/json",
+    "User-Agent": "Android",
+    "Client_type": "Android/32",
+    "Client_version": "1.0.14",
+    "X-Tenant-Id": "SHEIN",
+    "Ad_id": "342f47d0-910f-4a29-9bd7-cadb98a2eca9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Cache-Control": "no-cache",
+    "Content-Type": "application/x-www-form-urlencoded",
+    "Authorization": f"Bearer {CART_TOKEN}",
+}
+CART_PARAMS  = {
+    "client_type": "Android/32",
+    "client_version": "1.0.14",
 }
 
 # ── HEADERS ─────────────────────────────────────────────────────────────────────
@@ -157,7 +191,19 @@ HEADERS = {
     "X-Tenant-Id": "SHEIN",
     "Ad_id": "342f47d0-910f-4a29-9bd7-cadb98a2eca9",
     "Accept-Encoding": "gzip, deflate, br",
+    # Extra headers from app traffic — server may use these for routing/caching
+    "Usercohortvalues": "",
+    "Os": "",
+    "Ai": "",
+    "Ua": "",
+    "Vr": "",
 }
+
+# ── PER-PAGE LAST-MODIFIED CACHE ─────────────────────────────────────────────────
+# Stores the Last-Modified timestamp returned by the server for each listing page.
+# Sent back as If-Modified-Since next request — server returns 304 instantly if unchanged.
+_page_last_modified: dict[int, str] = {}
+_page_last_modified_lock = threading.Lock()
 
 # ── SHARED STATE ─────────────────────────────────────────────────────────────────
 check_existing_lock    = threading.Lock()
@@ -179,43 +225,97 @@ monitor_filters_lock     = threading.Lock()
 # A dedicated worker thread drains the queue, fetches PDP, updates seen_snapshots,
 # and sends follow-up stock alerts — completely off the hot listing loop path.
 pdp_queue            = queue.Queue()          # unbounded — worker drains as fast as it can
-pdp_cache_lock       = threading.Lock()       # guards seen_snapshots writes from worker thread
+pdp_cache_lock       = threading.Lock()       # guards seen_snapshots + variant_cache writes
+
+# ── VARIANT CODE CACHE ────────────────────────────────────────────────────────────
+# {option_code: {size: variant_code}}  e.g. {"443392005_iceblue": {"M": "443392005012"}}
+# Populated once from PDP. After that, restock scans use cart directly — no PDP needed.
+variant_cache        = {}
+VARIANT_CACHE_FILE   = "shein_variants.json"
 
 
 # ── LISTING FETCH (PARALLEL) ──────────────────────────────────────────────────
 
 def fetch_listing_page(page: int):
     params = {**LISTING_PARAMS, "currentPage": page}
-    # IPv6 session — keeps listing traffic on a different IP than PDP
-    resp = _ipv6_session.get(LISTING_URL, params=params, headers=HEADERS, timeout=15)
+
+    # Add If-Modified-Since if we have a cached timestamp for this page.
+    # Server returns 304 Not Modified instantly (no body) if nothing changed — very fast.
+    extra_headers = {}
+    with _page_last_modified_lock:
+        if page in _page_last_modified:
+            extra_headers["If-Modified-Since"] = _page_last_modified[page]
+
+    resp = _ipv6_session.get(
+        LISTING_URL, params=params,
+        headers={**HEADERS, **extra_headers},
+        timeout=15
+    )
+
+    # 304 = nothing changed on this page since last fetch — return sentinel
+    if resp.status_code == 304:
+        return page, None, None   # None signals "unchanged" to caller
+
     resp.raise_for_status()
+
+    # Cache the Last-Modified timestamp for next request
+    last_mod = resp.headers.get("Last-Modified") or resp.headers.get("Date")
+    if last_mod:
+        with _page_last_modified_lock:
+            _page_last_modified[page] = last_mod
+
     data = resp.json()
     return page, data.get("products", []), data.get("pagination", {}).get("totalPages", 1)
 
 
+# Stores the last known full product list per page — used to serve 304 unchanged pages
+_cached_page_products: dict[int, list] = {}
+_cached_page_products_lock = threading.Lock()
+
+
 def fetch_all_listing_products(silent=False):
     """
-    Speed-optimised listing fetch:
-    1. Fetch page 0 to discover total_pages, then fetch ALL remaining pages in parallel.
-    2. Uses a persistent connection pool (keep-alive) via the shared _ipv6_session.
+    Speed-optimised listing fetch with If-Modified-Since support:
+    - Page 0 fetched first to get total_pages
+    - All other pages fetched in parallel
+    - 304 Not Modified → reuse last known products for that page (instant)
+    - Last-Modified header cached per page for next request
     """
     try:
         t0 = time.time()
-        # Always fetch page 0 first to get total_pages count
         _, first_products, total_pages = fetch_listing_page(0)
 
-        results = [None] * total_pages
-        results[0] = first_products
+        # Handle page 0 result
+        if first_products is None:
+            # 304 — reuse cached page 0 products
+            with _cached_page_products_lock:
+                first_products = _cached_page_products.get(0, [])
+        else:
+            with _cached_page_products_lock:
+                _cached_page_products[0] = first_products
+
+        if total_pages is None:
+            # total_pages unknown from 304 — use cached page count
+            with _cached_page_products_lock:
+                total_pages = max(_cached_page_products.keys(), default=0) + 1
+
+        results = {0: first_products}
 
         if total_pages > 1:
-            # Fetch all remaining pages fully in parallel
             with ThreadPoolExecutor(max_workers=total_pages - 1) as ex:
                 futures = {ex.submit(fetch_listing_page, p): p for p in range(1, total_pages)}
                 for future in as_completed(futures):
                     pg, prods, _ = future.result()
+                    if prods is None:
+                        # 304 — reuse cached
+                        with _cached_page_products_lock:
+                            prods = _cached_page_products.get(pg, [])
+                    else:
+                        with _cached_page_products_lock:
+                            _cached_page_products[pg] = prods
                     results[pg] = prods
 
-        all_products = [p for page_prods in results if page_prods for p in page_prods]
+        all_products = [p for pg in sorted(results) for p in (results[pg] or [])]
 
         if not silent:
             print(f"  📋 Listing: {len(all_products)} products across {total_pages} pages in {time.time()-t0:.1f}s")
@@ -228,8 +328,12 @@ def fetch_all_listing_products(silent=False):
 
 # ── PDP FETCH ─────────────────────────────────────────────────────────────────
 
-def _parse_pdp_response(data: dict) -> dict:
-    """Parse raw PDP JSON → {size: stock_level} for in-stock sizes."""
+def _parse_pdp_response(data: dict, return_variant_codes: bool = False):
+    """
+    Parse raw PDP JSON.
+    return_variant_codes=False → {size: stock_level}  (normal use)
+    return_variant_codes=True  → {size: (stock_level, variant_code)}  (for cart verify)
+    """
     size_stock   = {}
     variant_list = data.get("variantOptions", [])
     if not variant_list:
@@ -247,53 +351,28 @@ def _parse_pdp_response(data: dict) -> dict:
                     break
         if not sc_size:
             continue
-        stock_info = variant.get("stock", {})
-        status = stock_info.get("stockLevelStatus", "outOfStock")
-        level  = int(stock_info.get("stockLevel", 0))
+        stock_info   = variant.get("stock", {})
+        status       = stock_info.get("stockLevelStatus", "outOfStock")
+        level        = int(stock_info.get("stockLevel", 0))
+        variant_code = variant.get("code", "")   # e.g. "443392005015"
         if status in ("inStock", "lowStock") and level > 0:
-            size_stock[sc_size] = level
+            if return_variant_codes:
+                size_stock[sc_size] = (level, variant_code)
+            else:
+                size_stock[sc_size] = level
     return size_stock
 
 
 def fetch_pdp_stock(option_code: str, retries: int = 3) -> dict:
     """
-    Returns {size: stock_level} for in-stock sizes.
-    retries=3  for new products (Job 1) — worth retrying, may be transient 403
-    retries=1  for restock scan (Job 2) — skip on fail, revisit next pass
-    Uses curl_cffi Chrome TLS fingerprint + IPv4 to bypass Akamai.
+    Primary entry point for stock checking.
+    Delegates to fetch_pdp_stock_with_cart_verify:
+      - PDP gives sizes + variant codes
+      - Cart verifies each in-stock size in real-time (parallel)
+      - Returns only confirmed in-stock sizes
+    retries=3 for new products, retries=1 for background restock scan.
     """
-    url = f"{PDP_BASE}/{option_code}"
-    for attempt in range(retries):
-        try:
-            session = get_cffi_session()
-            if USE_CFFI:
-                resp = pdp_get_ipv4(session, url, params=PDP_PARAMS, headers=HEADERS, timeout=15)
-            else:
-                resp = session.get(url, params=PDP_PARAMS, headers=HEADERS, timeout=15)
-
-            if resp.status_code == 403:
-                if retries > 1:
-                    print(f"  [PDP 403] {option_code} — attempt {attempt+1}/{retries}")
-                    time.sleep(attempt + 1)
-                    continue   # retry
-                return None   # single-attempt: 403 = skip, don't overwrite cache
-
-            if resp.status_code == 429:
-                retry_after = int(resp.headers.get("Retry-After", 3))
-                time.sleep(retry_after)
-                continue
-
-            resp.raise_for_status()
-            return _parse_pdp_response(resp.json())
-
-        except Exception as e:
-            if retries > 1:
-                print(f"  [PDP ERROR] {option_code} — {e}, attempt {attempt+1}/{retries}")
-            time.sleep(attempt + 1)
-
-    if retries > 1:
-        print(f"  [PDP FAILED] {option_code} — gave up after {retries} attempts")
-    return {}
+    return fetch_pdp_stock_with_cart_verify(option_code, retries=retries)
 
 
 def fetch_pdp_stocks_parallel(option_codes: list) -> dict:
@@ -310,6 +389,167 @@ def fetch_pdp_stocks_parallel(option_codes: list) -> dict:
 
 def get_option_code(product: dict) -> str:
     return product.get("fnlColorVariantData", {}).get("colorGroup") or product["code"]
+
+
+# ── CART-BASED STOCK VERIFICATION ────────────────────────────────────────────────
+
+def _cart_verify_variant(variant_code: str) -> bool:
+    """
+    POST one variant to cart. Returns True if server accepts it (in stock).
+    200/201 = in stock. Anything else = OOS or error.
+    """
+    url  = f"{CART_BASE}/{CART_ID}/entries"
+    data = f"code={variant_code}&qty=1&sourceStoreId=shein&fields=FULL"
+    try:
+        resp = _ipv6_session.post(
+            url, params=CART_PARAMS, headers=CART_HEADERS,
+            data=data, timeout=8,
+        )
+        return resp.status_code in (200, 201)
+    except Exception as e:
+        print(f"  [CART ERROR] {variant_code}: {e}")
+        return False
+
+
+def _cart_verify_all(size_vcodes: dict) -> dict:
+    """
+    Given {size: (stock_level, variant_code)}, cart-verify all in parallel.
+    Returns {size: stock_level} for cart-confirmed in-stock sizes only.
+    Falls back to PDP result if cart returns nothing (token expired/all failed).
+    """
+    confirmed = {}
+    with ThreadPoolExecutor(max_workers=max(len(size_vcodes), 1)) as ex:
+        futures = {
+            ex.submit(_cart_verify_variant, vcode): (size, level)
+            for size, (level, vcode) in size_vcodes.items()
+            if vcode
+        }
+        for future in as_completed(futures):
+            size, level = futures[future]
+            try:
+                if future.result():
+                    confirmed[size] = level
+            except Exception:
+                pass
+    # If nothing confirmed (token expired / all 4xx), fall back to PDP result
+    if not confirmed:
+        confirmed = {s: lv for s, (lv, _) in size_vcodes.items()}
+    return confirmed
+
+
+def fetch_pdp_stock_with_cart_verify(option_code: str, retries: int = 3) -> dict:
+    """
+    Smart two-phase stock check:
+
+    PHASE A — variant codes already cached (fast path):
+      Skip PDP entirely. Cart-verify all known variants directly.
+      → Only cart calls, no PDP round trip.
+
+    PHASE B — variant codes not cached yet (first time):
+      1. PDP fetch → parse ALL variants (not just in-stock) → cache ALL variant codes
+      2. Cart-verify the PDP-in-stock ones in parallel → confirmed sizes
+      → After this, future checks use Phase A forever.
+
+    Falls back to PDP-only if cart token expired or all cart calls fail.
+    """
+    with pdp_cache_lock:
+        cached_variants = variant_cache.get(option_code)   # {size: variant_code} or None
+
+    # ── PHASE A: cart-only (no PDP needed) ───────────────────────────────────────
+    if cached_variants:
+        # Build size_vcodes with dummy stock level — cart result is the truth
+        # We don't know current stock level without PDP, so use 1 as placeholder
+        # Real level comes from PDP on first fetch and is stored in seen_snapshots
+        size_vcodes = {size: (1, vcode) for size, vcode in cached_variants.items()}
+        confirmed   = {}
+        with ThreadPoolExecutor(max_workers=max(len(size_vcodes), 1)) as ex:
+            futures = {
+                ex.submit(_cart_verify_variant, vcode): size
+                for size, vcode in cached_variants.items()
+                if vcode
+            }
+            for future in as_completed(futures):
+                size = futures[future]
+                try:
+                    if future.result():
+                        confirmed[size] = 1   # in stock — level unknown without PDP
+                except Exception:
+                    pass
+        # If cart returned nothing fall back to PDP below
+        if confirmed:
+            return confirmed
+        # else fall through to Phase B (PDP) — cart may have failed
+
+    # ── PHASE B: PDP first, cache variants, then cart verify ─────────────────────
+    url = f"{PDP_BASE}/{option_code}"
+    for attempt in range(retries):
+        try:
+            session = get_cffi_session()
+            if USE_CFFI:
+                resp = pdp_get_ipv4(session, url, params=PDP_PARAMS, headers=PDP_HEADERS, timeout=15)
+            else:
+                resp = session.get(url, params=PDP_PARAMS, headers=PDP_HEADERS, timeout=15)
+
+            if resp.status_code == 403:
+                if retries > 1:
+                    print(f"  [PDP 403] {option_code} — attempt {attempt+1}/{retries}")
+                    time.sleep(attempt + 1)
+                    continue
+                return None
+
+            if resp.status_code == 429:
+                time.sleep(int(resp.headers.get("Retry-After", 3)))
+                continue
+
+            resp.raise_for_status()
+            data = resp.json()
+
+            # Parse ALL variants (in-stock and OOS) to cache their codes
+            all_variants = {}
+            variant_list = data.get("variantOptions", [])
+            if not variant_list:
+                base_options = data.get("baseOptions", [])
+                if base_options:
+                    variant_list = base_options[0].get("options", [])
+            for variant in variant_list:
+                sc_size = variant.get("scDisplaySize", "")
+                if not sc_size:
+                    for q in variant.get("variantOptionQualifiers", []):
+                        val  = q.get("value", "")
+                        name = q.get("name", "").lower()
+                        if val and "color" not in name:
+                            sc_size = val
+                            break
+                vcode = variant.get("code", "")
+                if sc_size and vcode:
+                    all_variants[sc_size] = vcode   # cache ALL sizes, even OOS ones
+
+            # Cache variant codes for this product
+            if all_variants:
+                with pdp_cache_lock:
+                    variant_cache[option_code] = all_variants
+                print(f"  [VARIANT] Cached {len(all_variants)} variant codes for {option_code}")
+
+            # Get PDP in-stock sizes for cart verification
+            pdp_in_stock = _parse_pdp_response(data, return_variant_codes=True)
+            # {size: (stock_level, variant_code)}
+
+            if not pdp_in_stock:
+                return {}   # PDP says all OOS
+
+            if CART_TOKEN:
+                return _cart_verify_all(pdp_in_stock)
+            else:
+                return {s: lv for s, (lv, _) in pdp_in_stock.items()}
+
+        except Exception as e:
+            if retries > 1:
+                print(f"  [PDP ERROR] {option_code} — {e}, attempt {attempt+1}/{retries}")
+            time.sleep(attempt + 1)
+
+    if retries > 1:
+        print(f"  [PDP FAILED] {option_code} — gave up after {retries} attempts")
+    return {}
 
 
 # ── TELEGRAM ─────────────────────────────────────────────────────────────────────
@@ -902,6 +1142,15 @@ def save_state(seen_snapshots: dict, absent_codes: set):
     except Exception as e:
         print(f"[STATE] Save failed: {e}")
 
+    # Save variant cache separately — grows over time, no need to rewrite every cycle
+    try:
+        with pdp_cache_lock:
+            vc_snapshot = dict(variant_cache)
+        with open(VARIANT_CACHE_FILE, "w") as f:
+            json.dump(vc_snapshot, f)
+    except Exception as e:
+        print(f"[STATE] Variant cache save failed: {e}")
+
 
 def load_state() -> tuple:
     """Load previous state. Returns (seen_snapshots, absent_codes) or empty dicts."""
@@ -912,13 +1161,26 @@ def load_state() -> tuple:
         absent = set(state.get("absent_codes", []))
         saved_at = state.get("saved_at", "unknown")
         print(f"[STATE] Loaded {len(seen)} products from previous run (saved: {saved_at})")
-        return seen, absent
     except FileNotFoundError:
         print("[STATE] No previous state found — starting fresh.")
-        return {}, set()
+        seen, absent = {}, set()
     except Exception as e:
         print(f"[STATE] Load failed ({e}) — starting fresh.")
-        return {}, set()
+        seen, absent = {}, set()
+
+    # Load variant cache
+    try:
+        with open(VARIANT_CACHE_FILE, "r") as f:
+            loaded_vc = json.load(f)
+        with pdp_cache_lock:
+            variant_cache.update(loaded_vc)
+        print(f"[STATE] Loaded variant codes for {len(loaded_vc)} products")
+    except FileNotFoundError:
+        print("[STATE] No variant cache found — will build from PDP.")
+    except Exception as e:
+        print(f"[STATE] Variant cache load failed ({e})")
+
+    return seen, absent
 
 # ── RAILWAY HEALTH CHECK SERVER ───────────────────────────────────────────────
 
@@ -1067,6 +1329,25 @@ def main():
     print("=" * 60)
     print("  SHEIN Men's Category Monitor  |  @CoBra_SR")
     print("=" * 60)
+
+    # Check cart token expiry at startup
+    try:
+        import base64 as _b64, json as _j, datetime as _dt
+        payload = CART_TOKEN.split(".")[1]
+        payload += "=" * (4 - len(payload) % 4)
+        exp = _j.loads(_b64.b64decode(payload)).get("exp", 0)
+        days_left = (exp - _dt.datetime.now().timestamp()) / 86400
+        exp_date  = _dt.datetime.fromtimestamp(exp).strftime("%Y-%m-%d")
+        if days_left <= 0:
+            print(f"❌ CART TOKEN EXPIRED on {exp_date}! Cart stock checks disabled.")
+            send_telegram(f"❌ <b>Cart token EXPIRED</b> on {exp_date}\nUpdate CART_TOKEN in script!\n@CoBra_SR")
+        elif days_left < 7:
+            print(f"⚠️  Cart token expires in {days_left:.0f} days ({exp_date})!")
+            send_telegram(f"⚠️ <b>Cart token expiring soon</b> — {days_left:.0f} days left ({exp_date})\nUpdate CART_TOKEN!\n@CoBra_SR")
+        else:
+            print(f"✅ Cart token valid — expires {exp_date} ({days_left:.0f} days)")
+    except Exception as e:
+        print(f"⚠️  Could not check cart token expiry: {e}")
 
     # Start Railway health check server first (required or deploy fails)
     start_health_server()
