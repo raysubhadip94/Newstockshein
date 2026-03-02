@@ -151,10 +151,14 @@ check_existing_lock    = threading.Lock()
 check_existing_running = False
 
 # ── MONITOR FILTERS (persistent across cycles) ────────────────────────────────────
-# /filter  : only alert for products that have AT LEAST ONE of these sizes in stock
-# /filterout: never alert for products that have ANY of these sizes
-monitor_filter_sizes     = set()   # empty = no filter (show all)
-monitor_filterout_sizes  = set()   # empty = no filterout
+# /filter      : only alert for products that have AT LEAST ONE of these sizes in stock
+# /filterout   : hide these sizes from alerts (suppress if no other sizes remain)
+# /filterprice : suppress products whose price exceeds this value
+# /flrange     : only alert for products whose price is within [min, max]
+monitor_filter_sizes     = set()    # empty = no filter (show all)
+monitor_filterout_sizes  = set()    # empty = no filterout
+monitor_price_max        = None     # None = no upper price cap
+monitor_price_range      = None     # None = no range; tuple (min, max) when set
 monitor_filters_lock     = threading.Lock()
 
 
@@ -389,26 +393,65 @@ def stock_increased(old_snap: dict, new_snap: dict):
     return len(changes) > 0, changes
 
 
+# ── PRICE EXTRACTION HELPER ──────────────────────────────────────────────────────
+
+def get_product_price(product: dict):
+    """
+    Extract numeric price from a product dict.
+    Tries offerPrice first (discounted), then regular price.
+    Returns float or None if unparseable.
+    """
+    import re
+    for key in ("offerPrice", "price"):
+        data = product.get(key, {})
+        raw  = data.get("value") or data.get("displayformattedValue") or data.get("formattedValue", "")
+        if isinstance(raw, (int, float)):
+            return float(raw)
+        if isinstance(raw, str):
+            cleaned = re.sub(r"[^\d.]", "", raw)
+            if cleaned:
+                try:
+                    return float(cleaned)
+                except ValueError:
+                    pass
+    return None
+
+
 # ── MONITOR FILTER HELPER ────────────────────────────────────────────────────────
 
-def apply_monitor_filters(size_stock: dict):
+def apply_monitor_filters(size_stock: dict, product: dict = None):
     """
     Returns a (possibly trimmed) size_stock dict to display, or None if filtered out entirely.
     Logic:
-      - If monitor_filterout_sizes set → skip product if it has ANY of those sizes
-      - If monitor_filter_sizes set    → only show those sizes; skip product if none match
+      - filterprice  → suppress if product price > max
+      - flrange      → suppress if product price outside [min, max]
+      - filterout    → hide those sizes; suppress if nothing remains
+      - filter       → only show matching sizes; suppress if none match
     """
     with monitor_filters_lock:
-        fin  = set(monitor_filter_sizes)
-        fout = set(monitor_filterout_sizes)
+        fin        = set(monitor_filter_sizes)
+        fout       = set(monitor_filterout_sizes)
+        price_max  = monitor_price_max
+        price_rng  = monitor_price_range
 
-    # filterout: remove excluded sizes from display; suppress only if nothing remains
+    # price filters
+    if product is not None and (price_max is not None or price_rng is not None):
+        price = get_product_price(product)
+        if price is not None:
+            if price_max is not None and price > price_max:
+                return None
+            if price_rng is not None:
+                lo, hi = price_rng
+                if not (lo <= price <= hi):
+                    return None
+
+    # filterout sizes
     if fout:
         size_stock = {s: q for s, q in size_stock.items() if s.upper() not in fout}
         if not size_stock:
             return None
 
-    # filter: only show matching sizes, suppress if none match
+    # filter sizes
     if fin:
         matched = {s: q for s, q in size_stock.items() if s.upper() in fin and q > 0}
         if not matched:
@@ -632,27 +675,116 @@ def telegram_listener(seen_snapshots: dict, listing_map: dict):
                         )
                 print(f"[{datetime.now():%H:%M:%S}] 🔓 /rfilter sizes={sizes or 'ALL'}")
 
-            # ── /flstat → show current filter/filterout status ───────────────────
-            elif text == "/flstat":
+            # ── /filterprice <amount> → suppress products above this price ─────
+            elif text.startswith("/filterprice"):
+                parts = text[len("/filterprice"):].strip()
+                if not parts:
+                    send_telegram(
+                        "⚠️ Please include a price after /filterprice\n"
+                        "Example: <code>/filterprice 600</code>",
+                        chat_id
+                    )
+                else:
+                    try:
+                        max_price = float(parts.replace(",", "").strip())
+                        with monitor_filters_lock:
+                            monitor_price_max   = max_price
+                            monitor_price_range = None   # clear range if set
+                        send_telegram(
+                            f"💰 <b>Price filter set</b>\n"
+                            f"🔽 Only alerting for products <b>≤ ₹{max_price:,.0f}</b>\n"
+                            f"Products above this price will be skipped.\n\n"
+                            f"Use /rflprice to remove.\n"
+                            f"@CoBra_SR",
+                            chat_id
+                        )
+                        print(f"[{{datetime.now():%H:%M:%S}}] 💰 /filterprice set: ≤{max_price}")
+                    except ValueError:
+                        send_telegram("❌ Invalid price. Example: <code>/filterprice 600</code>", chat_id)
+
+            # ── /flrange <min> <max> → only alert within price range ─────────────
+            elif text.startswith("/flrange"):
+                parts = text[len("/flrange"):].strip()
+                nums  = [x.replace(",", "").strip() for x in parts.split()]
+                if len(nums) != 2:
+                    send_telegram(
+                        "⚠️ Please include min and max prices after /flrange\n"
+                        "Example: <code>/flrange 100 300</code>",
+                        chat_id
+                    )
+                else:
+                    try:
+                        lo, hi = float(nums[0]), float(nums[1])
+                        if lo > hi:
+                            lo, hi = hi, lo
+                        with monitor_filters_lock:
+                            monitor_price_range = (lo, hi)
+                            monitor_price_max   = None   # clear max if set
+                        send_telegram(
+                            f"💰 <b>Price range set</b>\n"
+                            f"🔁 Only alerting for products between <b>₹{lo:,.0f} – ₹{hi:,.0f}</b>\n"
+                            f"Products outside this range will be skipped.\n\n"
+                            f"Use /rflprice to remove.\n"
+                            f"@CoBra_SR",
+                            chat_id
+                        )
+                        print(f"[{{datetime.now():%H:%M:%S}}] 💰 /flrange set: {lo}–{hi}")
+                    except ValueError:
+                        send_telegram("❌ Invalid prices. Example: <code>/flrange 100 300</code>", chat_id)
+
+            # ── /rflprice → remove price filter (both filterprice and flrange) ───
+            elif text == "/rflprice":
                 with monitor_filters_lock:
-                    fin  = sorted(monitor_filter_sizes)
-                    fout = sorted(monitor_filterout_sizes)
-
-                filter_str    = ", ".join(fin)  if fin  else "None (all sizes)"
-                filterout_str = ", ".join(fout) if fout else "None"
-
+                    had_max   = monitor_price_max
+                    had_range = monitor_price_range
+                    monitor_price_max   = None
+                    monitor_price_range = None
+                if had_max is not None:
+                    removed_str = f"max price ≤ ₹{had_max:,.0f}"
+                elif had_range is not None:
+                    removed_str = f"range ₹{had_range[0]:,.0f} – ₹{had_range[1]:,.0f}"
+                else:
+                    removed_str = "none was set"
                 send_telegram(
-                    f"🔧 <b>Filter Status</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"✅ Filter (show only):   <b>{filter_str}</b>\n"
-                    f"🚫 Filter-out (hide):    <b>{filterout_str}</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"/rfilter — remove all or specific filter\n"
-                    f"/rfilterout — remove all or specific filterout\n"
+                    f"✅ <b>Price filter cleared</b>\n"
+                    f"🔓 Removed: <b>{removed_str}</b>\n"
+                    f"Now alerting for all price ranges.\n"
                     f"@CoBra_SR",
                     chat_id
                 )
-                print(f"[{datetime.now():%H:%M:%S}] 🔧 /flstat from {chat_id}")
+                print(f"[{{datetime.now():%H:%M:%S}}] 🔓 /rflprice cleared")
+
+            # ── /flstat → show all active filters ────────────────────────────────
+            elif text == "/flstat":
+                with monitor_filters_lock:
+                    fin        = sorted(monitor_filter_sizes)
+                    fout       = sorted(monitor_filterout_sizes)
+                    price_max  = monitor_price_max
+                    price_rng  = monitor_price_range
+
+                filter_str    = ", ".join(fin)  if fin  else "None (all sizes)"
+                filterout_str = ", ".join(fout) if fout else "None"
+                if price_max is not None:
+                    price_str = f"≤ ₹{price_max:,.0f}  (/filterprice)"
+                elif price_rng is not None:
+                    price_str = f"₹{price_rng[0]:,.0f} – ₹{price_rng[1]:,.0f}  (/flrange)"
+                else:
+                    price_str = "None (all prices)"
+
+                send_telegram(
+                    f"🔧 <b>Active Filter Status</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"✅ Size filter:       <b>{filter_str}</b>\n"
+                    f"🚫 Size filter-out:  <b>{filterout_str}</b>\n"
+                    f"💰 Price filter:     <b>{price_str}</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"/rfilter [size] — remove size filter\n"
+                    f"/rfilterout [size] — remove filterout\n"
+                    f"/rflprice — remove price filter\n"
+                    f"@CoBra_SR",
+                    chat_id
+                )
+                print(f"[{{datetime.now():%H:%M:%S}}] 🔧 /flstat from {chat_id}")
 
             # ── /chstat → live stock snapshot from seen_snapshots ────────────────
             elif text == "/chstat":
@@ -660,7 +792,6 @@ def telegram_listener(seen_snapshots: dict, listing_map: dict):
                 in_stock  = sum(1 for v in seen_snapshots.values() if v and has_any_stock(v))
                 oos       = sum(1 for v in seen_snapshots.values() if v is not None and not has_any_stock(v))
                 unknown   = sum(1 for v in seen_snapshots.values() if v is None)
-                absent    = 0  # we don't have absent_codes reference here, that's fine
                 scan_status = "🔄 Running" if check_existing_running else "✅ Idle"
 
                 send_telegram(
@@ -677,7 +808,7 @@ def telegram_listener(seen_snapshots: dict, listing_map: dict):
                     f"@CoBra_SR",
                     chat_id
                 )
-                print(f"[{datetime.now():%H:%M:%S}] 📊 /chstat from {chat_id}")
+                print(f"[{{datetime.now():%H:%M:%S}}] 📊 /chstat from {chat_id}")
 
             elif text in ("/start", "/help"):
                 send_telegram(
@@ -687,26 +818,35 @@ def telegram_listener(seen_snapshots: dict, listing_map: dict):
                     "  🔄 Restocked products\n"
                     "  📈 Stock increases\n\n"
                     "━━━━━━━━━━━━━━━━━━\n"
-                    "<b>Manual Scan:</b>\n\n"
-                    "📦 /check_existing — scan all products\n"
-                    "🔍 /chex M L 38 — scan by size\n\n"
+                    "<b>📦 Manual Scan:</b>\n\n"
+                    "/check_existing — scan all products\n"
+                    "/chex M L 38 — scan by size\n\n"
                     "━━━━━━━━━━━━━━━━━━\n"
-                    "<b>Monitor Filters:</b>\n\n"
-                    "✅ /filter &lt;sizes&gt;\n"
-                    "    Alert ONLY if product has these sizes\n"
-                    "    <code>/filter M L</code>\n\n"
-                    "🚫 /filterout &lt;sizes&gt;\n"
-                    "    Hide these sizes from alerts\n"
-                    "    (still alerts if other sizes exist)\n"
-                    "    <code>/filterout 38 40</code>\n\n"
-                    "❌ /rfilter — clear all filters\n"
-                    "❌ /rfilter M — remove only M from filter\n\n"
-                    "❌ /rfilterout — clear all filterouts\n"
-                    "❌ /rfilterout 38 — remove only 38\n\n"
+                    "<b>📐 Size Filters:</b>\n\n"
+                    "/filter &lt;sizes&gt;\n"
+                    "  Alert ONLY if product has these sizes\n"
+                    "  <code>/filter M L XL</code>\n\n"
+                    "/filterout &lt;sizes&gt;\n"
+                    "  Hide these sizes from alerts\n"
+                    "  (still alerts if other sizes exist)\n"
+                    "  <code>/filterout 38 40</code>\n\n"
+                    "/rfilter — clear all size filters\n"
+                    "/rfilter M — remove only M\n\n"
+                    "/rfilterout — clear all filterouts\n"
+                    "/rfilterout 38 — remove only 38\n\n"
                     "━━━━━━━━━━━━━━━━━━\n"
-                    "<b>Status:</b>\n\n"
-                    "📊 /chstat — live stock count\n"
-                    "🔧 /flstat — active filter status\n\n"
+                    "<b>💰 Price Filters:</b>\n\n"
+                    "/filterprice &lt;amount&gt;\n"
+                    "  Only alert for products ≤ price\n"
+                    "  <code>/filterprice 600</code>\n\n"
+                    "/flrange &lt;min&gt; &lt;max&gt;\n"
+                    "  Only alert within price range\n"
+                    "  <code>/flrange 100 300</code>\n\n"
+                    "/rflprice — remove price filter\n\n"
+                    "━━━━━━━━━━━━━━━━━━\n"
+                    "<b>📊 Status Commands:</b>\n\n"
+                    "/chstat — live stock count\n"
+                    "/flstat — all active filters\n\n"
                     "━━━━━━━━━━━━━━━━━━\n"
                     "Size icons:\n"
                     "  🔴 1–3 units  🟡 4–10  🟢 11+\n\n"
@@ -830,11 +970,14 @@ def main():
         f"👕 Category: Men's SHEINVERSE\n"
         f"📦 Baseline: {len(seen_snapshots)} products\n"
         f"⏱️ Interval: {CHECK_INTERVAL}s\n"
-        f"💬 /check_existing or /chex — scan all stock\n"
+        f"💬 /check_existing — scan all stock\n"
         f"💬 /chex M L 38 — scan by size\n"
-        f"💬 /filter M L — only alert these sizes\n"
-        f"💬 /filterout 38 — suppress these sizes\n"
-        f"💬 /chstat — check filter status\n"
+        f"💬 /filter M — only alert this size\n"
+        f"💬 /filterout 38 — hide this size\n"
+        f"💬 /filterprice 600 — max price filter\n"
+        f"💬 /flrange 100 300 — price range filter\n"
+        f"💬 /chstat — stock status\n"
+        f"💬 /flstat — active filters\n"
         f"💬 /help — full command guide\n"
         f"@CoBra_SR"
     )
@@ -878,7 +1021,7 @@ def main():
                 # Truly new product — never seen before
                 new_snap = pdp_results.get(code, {})
                 if new_snap and has_any_stock(new_snap):
-                    display_snap = apply_monitor_filters(new_snap)
+                    display_snap = apply_monitor_filters(new_snap, product)
                     if display_snap is not None:
                         send_telegram(format_alert(product, "NEW", display_snap))
                         print(f"\n[{datetime.now():%H:%M:%S}] 🆕 NEW: {product.get('name', code)}")
@@ -896,7 +1039,7 @@ def main():
                 new_snap = pdp_results.get(code)
                 if new_snap is not None:
                     if has_any_stock(new_snap):
-                        display_snap = apply_monitor_filters(new_snap)
+                        display_snap = apply_monitor_filters(new_snap, product)
                         if display_snap is not None:
                             # Stock found — alert as NEW since we never had valid data
                             send_telegram(format_alert(product, "NEW", display_snap))
@@ -910,7 +1053,7 @@ def main():
                 old_snap = seen_snapshots.get(code) or {}
                 changed, change_lines = stock_increased(old_snap, new_snap)
                 if changed and has_any_stock(new_snap):
-                    display_snap = apply_monitor_filters(new_snap)
+                    display_snap = apply_monitor_filters(new_snap, product)
                     if display_snap is not None:
                         send_telegram(format_alert(product, "RESTOCK", display_snap, change_lines))
                         print(f"\n[{datetime.now():%H:%M:%S}] 🔄 RESTOCK: {product.get('name', code)}")
