@@ -524,7 +524,32 @@ def telegram_listener(seen_snapshots: dict, listing_map: dict):
                     print(f"[{datetime.now():%H:%M:%S}] 📐 /chex {sizes} from {chat_id}")
                     handle_check_existing(chat_id, size_filter=sizes)
 
-            # ── /filter <sizes> → only alert when product has these sizes ────────
+            # ── /filterout <sizes> — MUST come before /filter check ───────────────
+            elif text.startswith("/filterout"):
+                parts = text[len("/filterout"):].strip()
+                sizes = [s.strip().upper() for s in parts.replace(",", " ").split() if s.strip()]
+                if not sizes:
+                    send_telegram(
+                        "⚠️ Please include sizes after /filterout\n"
+                        "Example: <code>/filterout 38 40</code>",
+                        chat_id
+                    )
+                else:
+                    with monitor_filters_lock:
+                        monitor_filterout_sizes.update(sizes)
+                    current = sorted(monitor_filterout_sizes)
+                    send_telegram(
+                        f"🚫 <b>Filter-out set</b>\n"
+                        f"❌ Hiding sizes from alerts: <b>{', '.join(current)}</b>\n"
+                        f"Products with ONLY these sizes will be suppressed.\n"
+                        f"Products with other sizes will still alert (filtered sizes hidden).\n\n"
+                        f"Use /rfilterout to remove.\n"
+                        f"@CoBra_SR",
+                        chat_id
+                    )
+                    print(f"[{datetime.now():%H:%M:%S}] 🚫 /filterout set: {current}")
+
+            # ── /filter <sizes> → only alert when product has these sizes ─────────
             elif text.startswith("/filter"):
                 parts = text[len("/filter"):].strip()
                 sizes = [s.strip().upper() for s in parts.replace(",", " ").split() if s.strip()]
@@ -547,75 +572,108 @@ def telegram_listener(seen_snapshots: dict, listing_map: dict):
                     )
                     print(f"[{datetime.now():%H:%M:%S}] 🔍 /filter set: {current}")
 
-            # ── /filterout <sizes> → suppress alerts for these sizes ──────────────
-            elif text.startswith("/filterout"):
-                parts = text[len("/filterout"):].strip()
+            # ── /rfilterout [sizes] → remove specific or all filterout sizes ──────
+            elif text.startswith("/rfilterout"):
+                parts = text[len("/rfilterout"):].strip()
                 sizes = [s.strip().upper() for s in parts.replace(",", " ").split() if s.strip()]
-                if not sizes:
-                    send_telegram(
-                        "⚠️ Please include sizes after /filterout\n"
-                        "Example: <code>/filterout 38 40</code>",
-                        chat_id
-                    )
-                else:
-                    with monitor_filters_lock:
-                        monitor_filterout_sizes.update(sizes)
-                    current = sorted(monitor_filterout_sizes)
-                    send_telegram(
-                        f"🚫 <b>Filter-out set</b>\n"
-                        f"❌ Suppressing alerts for sizes: <b>{', '.join(current)}</b>\n\n"
-                        f"Use /rfilterout to remove these.\n"
-                        f"@CoBra_SR",
-                        chat_id
-                    )
-                    print(f"[{datetime.now():%H:%M:%S}] 🚫 /filterout set: {current}")
-
-            # ── /rfilter → remove monitor filter sizes ───────────────────────────
-            elif text == "/rfilter":
                 with monitor_filters_lock:
-                    removed = sorted(monitor_filter_sizes)
-                    monitor_filter_sizes.clear()
-                send_telegram(
-                    f"✅ <b>Monitor filters cleared</b>\n"
-                    f"🔓 Removed size filter: <b>{', '.join(removed) if removed else 'none was set'}</b>\n"
-                    f"Now alerting for all sizes.\n"
-                    f"@CoBra_SR",
-                    chat_id
-                )
-                print(f"[{datetime.now():%H:%M:%S}] 🔓 /rfilter — cleared: {removed}")
+                    if sizes:
+                        removed = [s for s in sizes if s in monitor_filterout_sizes]
+                        monitor_filterout_sizes.difference_update(sizes)
+                        remaining = sorted(monitor_filterout_sizes)
+                        rm_str = ", ".join(removed) if removed else "nothing matched"
+                        rem_str = ", ".join(remaining) if remaining else "None"
+                        send_telegram(
+                            f"✅ <b>Filter-out updated</b>\n"
+                            f"🗑️ Removed: <b>{rm_str}</b>\n"
+                            f"📋 Still filtered-out: <b>{rem_str}</b>\n"
+                            f"@CoBra_SR",
+                            chat_id
+                        )
+                    else:
+                        removed = sorted(monitor_filterout_sizes)
+                        monitor_filterout_sizes.clear()
+                        send_telegram(
+                            f"✅ <b>All filter-outs cleared</b>\n"
+                            f"🔓 Removed: <b>{', '.join(removed) if removed else 'none was set'}</b>\n"
+                            f"Now showing all sizes in alerts.\n"
+                            f"@CoBra_SR",
+                            chat_id
+                        )
+                print(f"[{datetime.now():%H:%M:%S}] 🔓 /rfilterout sizes={sizes or 'ALL'}")
 
-            # ── /rfilterout → remove filterout sizes ─────────────────────────────
-            elif text == "/rfilterout":
+            # ── /rfilter [sizes] → remove specific or all filter sizes ───────────
+            elif text.startswith("/rfilter"):
+                parts = text[len("/rfilter"):].strip()
+                sizes = [s.strip().upper() for s in parts.replace(",", " ").split() if s.strip()]
                 with monitor_filters_lock:
-                    removed = sorted(monitor_filterout_sizes)
-                    monitor_filterout_sizes.clear()
-                send_telegram(
-                    f"✅ <b>Filter-out cleared</b>\n"
-                    f"🔓 Removed suppressed sizes: <b>{', '.join(removed) if removed else 'none was set'}</b>\n"
-                    f"Now alerting for all sizes.\n"
-                    f"@CoBra_SR",
-                    chat_id
-                )
-                print(f"[{datetime.now():%H:%M:%S}] 🔓 /rfilterout — cleared: {removed}")
+                    if sizes:
+                        removed = [s for s in sizes if s in monitor_filter_sizes]
+                        monitor_filter_sizes.difference_update(sizes)
+                        remaining = sorted(monitor_filter_sizes)
+                        rm_str = ", ".join(removed) if removed else "nothing matched"
+                        rem_str = ", ".join(remaining) if remaining else "None (alerting all sizes)"
+                        send_telegram(
+                            f"✅ <b>Filter updated</b>\n"
+                            f"🗑️ Removed: <b>{rm_str}</b>\n"
+                            f"📋 Still filtering for: <b>{rem_str}</b>\n"
+                            f"@CoBra_SR",
+                            chat_id
+                        )
+                    else:
+                        removed = sorted(monitor_filter_sizes)
+                        monitor_filter_sizes.clear()
+                        send_telegram(
+                            f"✅ <b>All filters cleared</b>\n"
+                            f"🔓 Removed: <b>{', '.join(removed) if removed else 'none was set'}</b>\n"
+                            f"Now alerting for all sizes.\n"
+                            f"@CoBra_SR",
+                            chat_id
+                        )
+                print(f"[{datetime.now():%H:%M:%S}] 🔓 /rfilter sizes={sizes or 'ALL'}")
 
-            # ── /chstat → show current filter/monitor status ─────────────────────
-            elif text == "/chstat":
+            # ── /flstat → show current filter/filterout status ───────────────────
+            elif text == "/flstat":
                 with monitor_filters_lock:
                     fin  = sorted(monitor_filter_sizes)
                     fout = sorted(monitor_filterout_sizes)
 
                 filter_str    = ", ".join(fin)  if fin  else "None (all sizes)"
                 filterout_str = ", ".join(fout) if fout else "None"
-                scan_status   = "🔄 Running" if check_existing_running else "✅ Idle"
 
                 send_telegram(
-                    f"📊 <b>Monitor Status</b>\n"
+                    f"🔧 <b>Filter Status</b>\n"
                     f"━━━━━━━━━━━━━━━━━━\n"
-                    f"🔍 Filter (show only):  <b>{filter_str}</b>\n"
-                    f"🚫 Filter-out (skip):   <b>{filterout_str}</b>\n"
-                    f"🔎 Manual scan:         {scan_status}\n"
+                    f"✅ Filter (show only):   <b>{filter_str}</b>\n"
+                    f"🚫 Filter-out (hide):    <b>{filterout_str}</b>\n"
                     f"━━━━━━━━━━━━━━━━━━\n"
-                    f"Use /chex or /check_existing to scan all stock\n"
+                    f"/rfilter — remove all or specific filter\n"
+                    f"/rfilterout — remove all or specific filterout\n"
+                    f"@CoBra_SR",
+                    chat_id
+                )
+                print(f"[{datetime.now():%H:%M:%S}] 🔧 /flstat from {chat_id}")
+
+            # ── /chstat → live stock snapshot from seen_snapshots ────────────────
+            elif text == "/chstat":
+                total     = len(seen_snapshots)
+                in_stock  = sum(1 for v in seen_snapshots.values() if v and has_any_stock(v))
+                oos       = sum(1 for v in seen_snapshots.values() if v is not None and not has_any_stock(v))
+                unknown   = sum(1 for v in seen_snapshots.values() if v is None)
+                absent    = 0  # we don't have absent_codes reference here, that's fine
+                scan_status = "🔄 Running" if check_existing_running else "✅ Idle"
+
+                send_telegram(
+                    f"📊 <b>Current Stock Status</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"📦 Total tracked:    <b>{total}</b>\n"
+                    f"🟢 In stock:         <b>{in_stock}</b>\n"
+                    f"⚫ Out of stock:     <b>{oos}</b>\n"
+                    f"❓ Unknown (PDP ❌): <b>{unknown}</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"🔎 Manual scan:      {scan_status}\n"
+                    f"Use /chex or /check_existing to deep scan\n"
+                    f"Use /flstat to see active filters\n"
                     f"@CoBra_SR",
                     chat_id
                 )
@@ -629,27 +687,26 @@ def telegram_listener(seen_snapshots: dict, listing_map: dict):
                     "  🔄 Restocked products\n"
                     "  📈 Stock increases\n\n"
                     "━━━━━━━━━━━━━━━━━━\n"
-                    "<b>Manual Scan Commands:</b>\n\n"
-                    "📦 /check_existing\n"
-                    "    Scan ALL current products\n\n"
-                    "🔍 /chex &lt;sizes&gt;\n"
-                    "    Scan filtered by size\n"
-                    "    <code>/chex M L XL</code>\n"
-                    "    <code>/chex 30 32 38</code>\n\n"
+                    "<b>Manual Scan:</b>\n\n"
+                    "📦 /check_existing — scan all products\n"
+                    "🔍 /chex M L 38 — scan by size\n\n"
                     "━━━━━━━━━━━━━━━━━━\n"
-                    "<b>Monitor Filter Commands:</b>\n\n"
+                    "<b>Monitor Filters:</b>\n\n"
                     "✅ /filter &lt;sizes&gt;\n"
-                    "    Only alert for these sizes\n"
-                    "    <code>/filter M L</code> or <code>/filter 38</code>\n\n"
+                    "    Alert ONLY if product has these sizes\n"
+                    "    <code>/filter M L</code>\n\n"
                     "🚫 /filterout &lt;sizes&gt;\n"
-                    "    Suppress alerts for these sizes\n"
+                    "    Hide these sizes from alerts\n"
+                    "    (still alerts if other sizes exist)\n"
                     "    <code>/filterout 38 40</code>\n\n"
-                    "❌ /rfilter\n"
-                    "    Remove all /filter sizes\n\n"
-                    "❌ /rfilterout\n"
-                    "    Remove all /filterout sizes\n\n"
-                    "📊 /chstat\n"
-                    "    Check current filter status\n\n"
+                    "❌ /rfilter — clear all filters\n"
+                    "❌ /rfilter M — remove only M from filter\n\n"
+                    "❌ /rfilterout — clear all filterouts\n"
+                    "❌ /rfilterout 38 — remove only 38\n\n"
+                    "━━━━━━━━━━━━━━━━━━\n"
+                    "<b>Status:</b>\n\n"
+                    "📊 /chstat — live stock count\n"
+                    "🔧 /flstat — active filter status\n\n"
                     "━━━━━━━━━━━━━━━━━━\n"
                     "Size icons:\n"
                     "  🔴 1–3 units  🟡 4–10  🟢 11+\n\n"
