@@ -228,14 +228,42 @@ def fetch_all_listing_products(silent=False):
 
 # ── PDP FETCH ─────────────────────────────────────────────────────────────────
 
-def fetch_pdp_stock(option_code: str) -> dict:
+def _parse_pdp_response(data: dict) -> dict:
+    """Parse raw PDP JSON → {size: stock_level} for in-stock sizes."""
+    size_stock   = {}
+    variant_list = data.get("variantOptions", [])
+    if not variant_list:
+        base_options = data.get("baseOptions", [])
+        if base_options:
+            variant_list = base_options[0].get("options", [])
+    for variant in variant_list:
+        sc_size = variant.get("scDisplaySize", "")
+        if not sc_size:
+            for q in variant.get("variantOptionQualifiers", []):
+                val  = q.get("value", "")
+                name = q.get("name", "").lower()
+                if val and "color" not in name:
+                    sc_size = val
+                    break
+        if not sc_size:
+            continue
+        stock_info = variant.get("stock", {})
+        status = stock_info.get("stockLevelStatus", "outOfStock")
+        level  = int(stock_info.get("stockLevel", 0))
+        if status in ("inStock", "lowStock") and level > 0:
+            size_stock[sc_size] = level
+    return size_stock
+
+
+def fetch_pdp_stock(option_code: str, retries: int = 3) -> dict:
     """
-    Returns {size: stock_level} for all sizes with stock > 0.
-    Uses curl_cffi with Chrome TLS fingerprint + forced IPv4 to bypass Akamai 403.
-    IPv4 is intentional — PDP endpoint blocks IPv6 more aggressively.
+    Returns {size: stock_level} for in-stock sizes.
+    retries=3  for new products (Job 1) — worth retrying, may be transient 403
+    retries=1  for restock scan (Job 2) — skip on fail, revisit next pass
+    Uses curl_cffi Chrome TLS fingerprint + IPv4 to bypass Akamai.
     """
     url = f"{PDP_BASE}/{option_code}"
-    for attempt in range(3):
+    for attempt in range(retries):
         try:
             session = get_cffi_session()
             if USE_CFFI:
@@ -244,9 +272,10 @@ def fetch_pdp_stock(option_code: str) -> dict:
                 resp = session.get(url, params=PDP_PARAMS, headers=HEADERS, timeout=15)
 
             if resp.status_code == 403:
-                print(f"  [PDP 403] {option_code} — attempt {attempt+1}/3")
-                time.sleep(attempt + 1)
-                continue
+                if retries > 1:
+                    print(f"  [PDP 403] {option_code} — attempt {attempt+1}/{retries}")
+                    time.sleep(attempt + 1)
+                return {}   # treat 403 as OOS for restock scan, retry loop for new products
 
             if resp.status_code == 429:
                 retry_after = int(resp.headers.get("Retry-After", 3))
@@ -254,41 +283,15 @@ def fetch_pdp_stock(option_code: str) -> dict:
                 continue
 
             resp.raise_for_status()
-            data = resp.json()
-
-            size_stock = {}
-
-            # variantOptions is primary, fall back to baseOptions[0].options
-            variant_list = data.get("variantOptions", [])
-            if not variant_list:
-                base_options = data.get("baseOptions", [])
-                if base_options:
-                    variant_list = base_options[0].get("options", [])
-
-            for variant in variant_list:
-                sc_size = variant.get("scDisplaySize", "")
-                if not sc_size:
-                    for q in variant.get("variantOptionQualifiers", []):
-                        val  = q.get("value", "")
-                        name = q.get("name", "").lower()
-                        if val and "color" not in name:
-                            sc_size = val
-                            break
-                if not sc_size:
-                    continue
-                stock_info = variant.get("stock", {})
-                status = stock_info.get("stockLevelStatus", "outOfStock")
-                level  = int(stock_info.get("stockLevel", 0))
-                if status in ("inStock", "lowStock") and level > 0:
-                    size_stock[sc_size] = level
-
-            return size_stock
+            return _parse_pdp_response(resp.json())
 
         except Exception as e:
-            print(f"  [PDP ERROR] {option_code} — {e}, attempt {attempt+1}/3")
+            if retries > 1:
+                print(f"  [PDP ERROR] {option_code} — {e}, attempt {attempt+1}/{retries}")
             time.sleep(attempt + 1)
 
-    print(f"  [PDP FAILED] {option_code} — gave up after 3 attempts")
+    if retries > 1:
+        print(f"  [PDP FAILED] {option_code} — gave up after {retries} attempts")
     return {}
 
 
@@ -1019,12 +1022,13 @@ def pdp_worker(seen_snapshots: dict, listing_map: dict):
                 continue
 
             try:
-                new_snap = fetch_pdp_stock(code)
-                if new_snap is None:
-                    continue   # PDP failed — skip, keep old cached value
+                # Single attempt only — no retries during restock scan.
+                # If 403/fail, skip this product and revisit next pass.
+                new_snap = fetch_pdp_stock(code, retries=1)
 
+                # Only update cache if we got a response (even empty = OOS is valid)
                 with pdp_cache_lock:
-                    seen_snapshots[code] = new_snap   # always update cache
+                    seen_snapshots[code] = new_snap
 
                 name = product.get("name", code)
 
@@ -1042,8 +1046,16 @@ def pdp_worker(seen_snapshots: dict, listing_map: dict):
             except Exception as e:
                 print(f"\n[PDP-WORKER ERROR] restock scan {code}: {e}")
 
-        # Brief pause between full restock scan passes to avoid hammering API
-        time.sleep(0.1)
+            # Throttle between restock scan requests — avoids Akamai 403 rate limit
+            # 0.5–1.0s gap means ~43 products scanned per 30–60s (plenty fast for restocks)
+            time.sleep(random.uniform(0.5, 1.0))
+
+            # Check queue again between each product
+            if not pdp_queue.empty():
+                break
+
+        # Brief pause before starting next full pass
+        time.sleep(0.5)
 
 
 # ── MAIN ────────────────────────────────────────────────────────────────────────
