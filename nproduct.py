@@ -6,9 +6,20 @@ Run on PC/laptop (not Termux) — requires curl_cffi:
     pip install requests curl_cffi
 
 Default:  Monitors every 2s for NEW or RESTOCKED products → PDP stock check → alert if in stock
-Commands: /check_existing   → scan ALL products (no filter)
-          /chex <sizes>    → scan with size filter e.g. /chex M L 38
-          /help            → command guide
+
+Manual Scan Commands:
+  /check_existing   → scan ALL products (no filter)
+  /chex <sizes>     → scan with size filter e.g. /chex M L 38
+
+Monitor Filter Commands (persist until removed):
+  /filter <sizes>   → only alert for NEW/RESTOCK that have these sizes e.g. /filter M L
+  /filterout <sizes>→ suppress alerts for products with these sizes e.g. /filterout 38
+  /rfilter          → remove all /filter sizes
+  /rfilterout       → remove all /filterout sizes
+  /chstat           → show current filter status
+
+Other:
+  /help             → full command guide
 """
 
 import requests
@@ -138,6 +149,13 @@ HEADERS = {
 # ── SHARED STATE ─────────────────────────────────────────────────────────────────
 check_existing_lock    = threading.Lock()
 check_existing_running = False
+
+# ── MONITOR FILTERS (persistent across cycles) ────────────────────────────────────
+# /filter  : only alert for products that have AT LEAST ONE of these sizes in stock
+# /filterout: never alert for products that have ANY of these sizes
+monitor_filter_sizes     = set()   # empty = no filter (show all)
+monitor_filterout_sizes  = set()   # empty = no filterout
+monitor_filters_lock     = threading.Lock()
 
 
 # ── LISTING FETCH (PARALLEL) ──────────────────────────────────────────────────
@@ -371,6 +389,35 @@ def stock_increased(old_snap: dict, new_snap: dict):
     return len(changes) > 0, changes
 
 
+# ── MONITOR FILTER HELPER ────────────────────────────────────────────────────────
+
+def apply_monitor_filters(size_stock: dict):
+    """
+    Returns a (possibly trimmed) size_stock dict to display, or None if filtered out entirely.
+    Logic:
+      - If monitor_filterout_sizes set → skip product if it has ANY of those sizes
+      - If monitor_filter_sizes set    → only show those sizes; skip product if none match
+    """
+    with monitor_filters_lock:
+        fin  = set(monitor_filter_sizes)
+        fout = set(monitor_filterout_sizes)
+
+    # filterout: remove excluded sizes from display; suppress only if nothing remains
+    if fout:
+        size_stock = {s: q for s, q in size_stock.items() if s.upper() not in fout}
+        if not size_stock:
+            return None
+
+    # filter: only show matching sizes, suppress if none match
+    if fin:
+        matched = {s: q for s, q in size_stock.items() if s.upper() in fin and q > 0}
+        if not matched:
+            return None
+        return matched
+
+    return size_stock
+
+
 # ── SCAN HANDLER ─────────────────────────────────────────────────────────────────
 
 def run_scan(chat_id: str, size_filter: list = None):
@@ -448,7 +495,6 @@ def telegram_listener(seen_snapshots: dict, listing_map: dict):
     print(f"[{datetime.now():%H:%M:%S}] 🤖 Telegram command listener started.")
 
     while True:
-        global check_existing_running
         updates = get_telegram_updates(offset)
         for update in updates:
             offset  = update["update_id"] + 1
@@ -459,13 +505,13 @@ def telegram_listener(seen_snapshots: dict, listing_map: dict):
             if not text or not chat_id:
                 continue
 
-            # /check_existing → scan ALL, no filter
-            if text == "/check_existing":
+            # ── /check_existing → scan ALL, no filter ────────────────────────────
+            if text == "/check_existing" or text == "/chex":
                 print(f"[{datetime.now():%H:%M:%S}] 📥 /check_existing from {chat_id}")
                 handle_check_existing(chat_id, size_filter=None)
 
-            # /chex <sizes> → scan with size filter e.g. /chex M L 38
-            elif text.startswith("/chex"):
+            # ── /chex <sizes> → scan with size filter ────────────────────────────
+            elif text.startswith("/chex "):
                 parts = text[len("/chex"):].strip()
                 sizes = [s.strip().upper() for s in parts.replace(",", " ").split() if s.strip()]
                 if not sizes:
@@ -478,6 +524,103 @@ def telegram_listener(seen_snapshots: dict, listing_map: dict):
                     print(f"[{datetime.now():%H:%M:%S}] 📐 /chex {sizes} from {chat_id}")
                     handle_check_existing(chat_id, size_filter=sizes)
 
+            # ── /filter <sizes> → only alert when product has these sizes ────────
+            elif text.startswith("/filter"):
+                parts = text[len("/filter"):].strip()
+                sizes = [s.strip().upper() for s in parts.replace(",", " ").split() if s.strip()]
+                if not sizes:
+                    send_telegram(
+                        "⚠️ Please include sizes after /filter\n"
+                        "Example: <code>/filter M L XL</code> or <code>/filter 38 40</code>",
+                        chat_id
+                    )
+                else:
+                    with monitor_filters_lock:
+                        monitor_filter_sizes.update(sizes)
+                    current = sorted(monitor_filter_sizes)
+                    send_telegram(
+                        f"✅ <b>Monitor filter set</b>\n"
+                        f"🔍 Only alerting for sizes: <b>{', '.join(current)}</b>\n\n"
+                        f"Use /rfilter to remove these filters.\n"
+                        f"@CoBra_SR",
+                        chat_id
+                    )
+                    print(f"[{datetime.now():%H:%M:%S}] 🔍 /filter set: {current}")
+
+            # ── /filterout <sizes> → suppress alerts for these sizes ──────────────
+            elif text.startswith("/filterout"):
+                parts = text[len("/filterout"):].strip()
+                sizes = [s.strip().upper() for s in parts.replace(",", " ").split() if s.strip()]
+                if not sizes:
+                    send_telegram(
+                        "⚠️ Please include sizes after /filterout\n"
+                        "Example: <code>/filterout 38 40</code>",
+                        chat_id
+                    )
+                else:
+                    with monitor_filters_lock:
+                        monitor_filterout_sizes.update(sizes)
+                    current = sorted(monitor_filterout_sizes)
+                    send_telegram(
+                        f"🚫 <b>Filter-out set</b>\n"
+                        f"❌ Suppressing alerts for sizes: <b>{', '.join(current)}</b>\n\n"
+                        f"Use /rfilterout to remove these.\n"
+                        f"@CoBra_SR",
+                        chat_id
+                    )
+                    print(f"[{datetime.now():%H:%M:%S}] 🚫 /filterout set: {current}")
+
+            # ── /rfilter → remove monitor filter sizes ───────────────────────────
+            elif text == "/rfilter":
+                with monitor_filters_lock:
+                    removed = sorted(monitor_filter_sizes)
+                    monitor_filter_sizes.clear()
+                send_telegram(
+                    f"✅ <b>Monitor filters cleared</b>\n"
+                    f"🔓 Removed size filter: <b>{', '.join(removed) if removed else 'none was set'}</b>\n"
+                    f"Now alerting for all sizes.\n"
+                    f"@CoBra_SR",
+                    chat_id
+                )
+                print(f"[{datetime.now():%H:%M:%S}] 🔓 /rfilter — cleared: {removed}")
+
+            # ── /rfilterout → remove filterout sizes ─────────────────────────────
+            elif text == "/rfilterout":
+                with monitor_filters_lock:
+                    removed = sorted(monitor_filterout_sizes)
+                    monitor_filterout_sizes.clear()
+                send_telegram(
+                    f"✅ <b>Filter-out cleared</b>\n"
+                    f"🔓 Removed suppressed sizes: <b>{', '.join(removed) if removed else 'none was set'}</b>\n"
+                    f"Now alerting for all sizes.\n"
+                    f"@CoBra_SR",
+                    chat_id
+                )
+                print(f"[{datetime.now():%H:%M:%S}] 🔓 /rfilterout — cleared: {removed}")
+
+            # ── /chstat → show current filter/monitor status ─────────────────────
+            elif text == "/chstat":
+                with monitor_filters_lock:
+                    fin  = sorted(monitor_filter_sizes)
+                    fout = sorted(monitor_filterout_sizes)
+
+                filter_str    = ", ".join(fin)  if fin  else "None (all sizes)"
+                filterout_str = ", ".join(fout) if fout else "None"
+                scan_status   = "🔄 Running" if check_existing_running else "✅ Idle"
+
+                send_telegram(
+                    f"📊 <b>Monitor Status</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"🔍 Filter (show only):  <b>{filter_str}</b>\n"
+                    f"🚫 Filter-out (skip):   <b>{filterout_str}</b>\n"
+                    f"🔎 Manual scan:         {scan_status}\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"Use /chex or /check_existing to scan all stock\n"
+                    f"@CoBra_SR",
+                    chat_id
+                )
+                print(f"[{datetime.now():%H:%M:%S}] 📊 /chstat from {chat_id}")
+
             elif text in ("/start", "/help"):
                 send_telegram(
                     "👋 <b>SHEIN Men's Monitor Bot</b>\n\n"
@@ -486,15 +629,27 @@ def telegram_listener(seen_snapshots: dict, listing_map: dict):
                     "  🔄 Restocked products\n"
                     "  📈 Stock increases\n\n"
                     "━━━━━━━━━━━━━━━━━━\n"
-                    "<b>Commands:</b>\n\n"
+                    "<b>Manual Scan Commands:</b>\n\n"
                     "📦 /check_existing\n"
-                    "    Scan ALL current products\n"
-                    "    Shows every in-stock item\n\n"
+                    "    Scan ALL current products\n\n"
                     "🔍 /chex &lt;sizes&gt;\n"
                     "    Scan filtered by size\n"
                     "    <code>/chex M L XL</code>\n"
-                    "    <code>/chex 30 32 38</code>\n"
-                    "    <code>/chex M 38 XXL</code>\n\n"
+                    "    <code>/chex 30 32 38</code>\n\n"
+                    "━━━━━━━━━━━━━━━━━━\n"
+                    "<b>Monitor Filter Commands:</b>\n\n"
+                    "✅ /filter &lt;sizes&gt;\n"
+                    "    Only alert for these sizes\n"
+                    "    <code>/filter M L</code> or <code>/filter 38</code>\n\n"
+                    "🚫 /filterout &lt;sizes&gt;\n"
+                    "    Suppress alerts for these sizes\n"
+                    "    <code>/filterout 38 40</code>\n\n"
+                    "❌ /rfilter\n"
+                    "    Remove all /filter sizes\n\n"
+                    "❌ /rfilterout\n"
+                    "    Remove all /filterout sizes\n\n"
+                    "📊 /chstat\n"
+                    "    Check current filter status\n\n"
                     "━━━━━━━━━━━━━━━━━━\n"
                     "Size icons:\n"
                     "  🔴 1–3 units  🟡 4–10  🟢 11+\n\n"
@@ -618,8 +773,12 @@ def main():
         f"👕 Category: Men's SHEINVERSE\n"
         f"📦 Baseline: {len(seen_snapshots)} products\n"
         f"⏱️ Interval: {CHECK_INTERVAL}s\n"
-        f"💬 /check_existing — scan all stock\n"
+        f"💬 /check_existing or /chex — scan all stock\n"
         f"💬 /chex M L 38 — scan by size\n"
+        f"💬 /filter M L — only alert these sizes\n"
+        f"💬 /filterout 38 — suppress these sizes\n"
+        f"💬 /chstat — check filter status\n"
+        f"💬 /help — full command guide\n"
         f"@CoBra_SR"
     )
 
@@ -662,9 +821,13 @@ def main():
                 # Truly new product — never seen before
                 new_snap = pdp_results.get(code, {})
                 if new_snap and has_any_stock(new_snap):
-                    send_telegram(format_alert(product, "NEW", new_snap))
-                    print(f"\n[{datetime.now():%H:%M:%S}] 🆕 NEW: {product.get('name', code)}")
-                    alerts_sent += 1
+                    display_snap = apply_monitor_filters(new_snap)
+                    if display_snap is not None:
+                        send_telegram(format_alert(product, "NEW", display_snap))
+                        print(f"\n[{datetime.now():%H:%M:%S}] 🆕 NEW: {product.get('name', code)}")
+                        alerts_sent += 1
+                    else:
+                        print(f"\n[{datetime.now():%H:%M:%S}] 🆕 NEW (filtered out): {product.get('name', code)}")
                 else:
                     reason = "all sizes OOS" if new_snap == {} else "PDP failed — will retry"
                     print(f"\n[{datetime.now():%H:%M:%S}] 🆕 NEW (skipped — {reason}): {product.get('name', code)}")
@@ -676,10 +839,12 @@ def main():
                 new_snap = pdp_results.get(code)
                 if new_snap is not None:
                     if has_any_stock(new_snap):
-                        # Stock found — alert as NEW since we never had valid data
-                        send_telegram(format_alert(product, "NEW", new_snap))
-                        print(f"\n[{datetime.now():%H:%M:%S}] 🆕 NEW (PDP recovered): {product.get('name', code)}")
-                        alerts_sent += 1
+                        display_snap = apply_monitor_filters(new_snap)
+                        if display_snap is not None:
+                            # Stock found — alert as NEW since we never had valid data
+                            send_telegram(format_alert(product, "NEW", display_snap))
+                            print(f"\n[{datetime.now():%H:%M:%S}] 🆕 NEW (PDP recovered): {product.get('name', code)}")
+                            alerts_sent += 1
                     seen_snapshots[code] = new_snap  # update with real data (even if empty)
                 # else PDP failed again — leave as None, will retry next cycle
 
@@ -688,9 +853,13 @@ def main():
                 old_snap = seen_snapshots.get(code) or {}
                 changed, change_lines = stock_increased(old_snap, new_snap)
                 if changed and has_any_stock(new_snap):
-                    send_telegram(format_alert(product, "RESTOCK", new_snap, change_lines))
-                    print(f"\n[{datetime.now():%H:%M:%S}] 🔄 RESTOCK: {product.get('name', code)}")
-                    alerts_sent += 1
+                    display_snap = apply_monitor_filters(new_snap)
+                    if display_snap is not None:
+                        send_telegram(format_alert(product, "RESTOCK", display_snap, change_lines))
+                        print(f"\n[{datetime.now():%H:%M:%S}] 🔄 RESTOCK: {product.get('name', code)}")
+                        alerts_sent += 1
+                    else:
+                        print(f"\n[{datetime.now():%H:%M:%S}] 🔄 RESTOCK (filtered out): {product.get('name', code)}")
                 absent_codes.discard(code)
                 seen_snapshots[code] = new_snap
 
