@@ -30,6 +30,7 @@ import threading
 import random
 import socket
 import os
+import queue
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -72,8 +73,20 @@ def make_ipv4_session() -> requests.Session:
     return s
 
 def make_ipv6_session() -> requests.Session:
-    """Returns a plain requests.Session — uses OS default (prefers IPv6 if available)."""
-    return requests.Session()
+    """
+    Returns a requests.Session with an enlarged connection pool.
+    Pool size = 20 so parallel listing page fetches reuse TCP connections (keep-alive).
+    This avoids a new TLS handshake on every cycle → shaves ~100-300ms per poll.
+    """
+    s = requests.Session()
+    adapter = HTTPAdapter(
+        pool_connections=10,
+        pool_maxsize=20,
+        max_retries=0,          # we handle retries ourselves
+    )
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
+    return s
 
 # Global IPv6 session for listing + Telegram (shared, thread-safe for reads)
 _ipv6_session = make_ipv6_session()
@@ -107,7 +120,7 @@ def pdp_get_ipv4(session, url, **kwargs):
 # ── CONFIG ─────────────────────────────────────────────────────────────────────
 BOT_TOKEN      = "8679800339:AAH1uKwHey2l7tCyl3GPbJW0wzwCzS81I4w"
 CHAT_ID        = "1276512925"
-CHECK_INTERVAL = 2
+CHECK_INTERVAL = 1
 BASE_URL       = "https://sheinindia.in"
 STATE_FILE     = "shein_state.json"  # saves seen_snapshots + absent_codes between restarts
 
@@ -161,6 +174,13 @@ monitor_price_max        = None     # None = no upper price cap
 monitor_price_range      = None     # None = no range; tuple (min, max) when set
 monitor_filters_lock     = threading.Lock()
 
+# ── PDP BACKGROUND WORKER QUEUE ───────────────────────────────────────────────────
+# Listing loop enqueues (code, product, reason) tuples.
+# A dedicated worker thread drains the queue, fetches PDP, updates seen_snapshots,
+# and sends follow-up stock alerts — completely off the hot listing loop path.
+pdp_queue            = queue.Queue()          # unbounded — worker drains as fast as it can
+pdp_cache_lock       = threading.Lock()       # guards seen_snapshots writes from worker thread
+
 
 # ── LISTING FETCH (PARALLEL) ──────────────────────────────────────────────────
 
@@ -174,23 +194,28 @@ def fetch_listing_page(page: int):
 
 
 def fetch_all_listing_products(silent=False):
+    """
+    Speed-optimised listing fetch:
+    1. Fetch page 0 to discover total_pages, then fetch ALL remaining pages in parallel.
+    2. Uses a persistent connection pool (keep-alive) via the shared _ipv6_session.
+    """
     try:
         t0 = time.time()
+        # Always fetch page 0 first to get total_pages count
         _, first_products, total_pages = fetch_listing_page(0)
+
         results = [None] * total_pages
         results[0] = first_products
 
         if total_pages > 1:
+            # Fetch all remaining pages fully in parallel
             with ThreadPoolExecutor(max_workers=total_pages - 1) as ex:
                 futures = {ex.submit(fetch_listing_page, p): p for p in range(1, total_pages)}
                 for future in as_completed(futures):
                     pg, prods, _ = future.result()
                     results[pg] = prods
 
-        all_products = []
-        for page_prods in results:
-            if page_prods:
-                all_products.extend(page_prods)
+        all_products = [p for page_prods in results if page_prods for p in page_prods]
 
         if not silent:
             print(f"  📋 Listing: {len(all_products)} products across {total_pages} pages in {time.time()-t0:.1f}s")
@@ -914,6 +939,113 @@ def start_health_server():
     print(f"✅ Health check server listening on port {port}")
 
 
+# ── PDP BACKGROUND WORKER ────────────────────────────────────────────────────────
+
+def pdp_worker(seen_snapshots: dict, listing_map: dict):
+    """
+    Two jobs in one thread:
+
+    JOB 1 — Process pdp_queue (priority):
+      New/returned products detected by listing loop.
+      reason="new"      → alert as NEW if in stock
+      reason="returned" → alert as RESTOCK if sizes increased
+      reason="retry"    → PDP previously failed, try again silently
+
+    JOB 2 — Continuous restock scan of ALL cached products:
+      After draining the queue, re-check every cached product's sizes.
+      If any size has more stock than last snapshot → RESTOCK alert.
+      This is how OOS→in-stock changes are caught for existing products.
+    """
+    print(f"[{datetime.now():%H:%M:%S}] 🔧 PDP background worker started.")
+
+    while True:
+        # ── JOB 1: drain queue first (new products take priority) ────────────────
+        while not pdp_queue.empty():
+            try:
+                code, product, reason, old_snap = pdp_queue.get(block=False)
+            except queue.Empty:
+                break
+
+            try:
+                snap = fetch_pdp_stock(code)
+                name = product.get("name", code)
+
+                with pdp_cache_lock:
+                    seen_snapshots[code] = snap   # cache result (even {} = confirmed OOS)
+
+                if snap and has_any_stock(snap):
+                    display_snap = apply_monitor_filters(snap, product)
+                    if display_snap is not None:
+                        if reason in ("new", "retry"):
+                            send_telegram(format_alert(product, "NEW", display_snap))
+                            print(f"\n[PDP-WORKER] ✅ NEW in stock: {name}")
+                        elif reason == "returned":
+                            _, change_lines = stock_increased(old_snap or {}, snap)
+                            send_telegram(format_alert(product, "RESTOCK", display_snap, change_lines))
+                            print(f"\n[PDP-WORKER] 🔄 RESTOCK (returned): {name}")
+                    else:
+                        print(f"\n[PDP-WORKER] ⛔ Filtered: {name}")
+                elif snap is not None:
+                    print(f"\n[PDP-WORKER] ⚫ OOS confirmed: {name}")
+                else:
+                    # PDP failed — keep as None so listing loop re-queues next cycle
+                    with pdp_cache_lock:
+                        seen_snapshots[code] = None
+                    print(f"\n[PDP-WORKER] ⚠️ PDP failed, will retry: {code}")
+
+            except Exception as e:
+                print(f"\n[PDP-WORKER ERROR] new/returned {code}: {e}")
+                with pdp_cache_lock:
+                    seen_snapshots[code] = None
+            finally:
+                pdp_queue.task_done()
+
+        # ── JOB 2: restock scan — re-check all cached products once per pass ─────
+        # Take a snapshot of current codes so we don't hold the lock during PDP calls
+        with pdp_cache_lock:
+            restock_targets = [
+                (code, snap)
+                for code, snap in seen_snapshots.items()
+                if snap is not None   # skip PDP-pending items
+            ]
+
+        for code, old_snap in restock_targets:
+            # If a new item arrived in the queue, pause restock scan to handle it first
+            if not pdp_queue.empty():
+                break
+
+            product = listing_map.get(code)
+            if not product:
+                continue
+
+            try:
+                new_snap = fetch_pdp_stock(code)
+                if new_snap is None:
+                    continue   # PDP failed — skip, keep old cached value
+
+                with pdp_cache_lock:
+                    seen_snapshots[code] = new_snap   # always update cache
+
+                name = product.get("name", code)
+
+                if new_snap and has_any_stock(new_snap):
+                    changed, change_lines = stock_increased(old_snap or {}, new_snap)
+                    if changed:
+                        display_snap = apply_monitor_filters(new_snap, product)
+                        if display_snap is not None:
+                            send_telegram(format_alert(product, "RESTOCK", display_snap, change_lines))
+                            print(f"\n[PDP-WORKER] 🔄 RESTOCK detected: {name}")
+                        else:
+                            print(f"\n[PDP-WORKER] ⛔ Restock filtered: {name}")
+                # No stock change or still OOS → update cache silently
+
+            except Exception as e:
+                print(f"\n[PDP-WORKER ERROR] restock scan {code}: {e}")
+
+        # Brief pause between full restock scan passes to avoid hammering API
+        time.sleep(0.1)
+
+
 # ── MAIN ────────────────────────────────────────────────────────────────────────
 
 def main():
@@ -945,12 +1077,9 @@ def main():
         listing_map[get_option_code(p)] = p
 
     if needs_pdp_init:
-        print(f"  🔍 Fetching PDP for {len(needs_pdp_init)} new/unknown products…")
-        t0 = time.time()
-        initial_pdp = fetch_pdp_stocks_parallel(list(needs_pdp_init))
-        print(f"  ✅ PDP done in {time.time()-t0:.1f}s")
-        for code, snap in initial_pdp.items():
-            seen_snapshots[code] = snap if snap else None
+        print(f"  🔍 {len(needs_pdp_init)} new products will be PDP-checked by background worker…")
+        for code in needs_pdp_init:
+            seen_snapshots[code] = None   # sentinel: PDP pending
     else:
         print(f"  ✅ All {len(current_codes_init)} products already known from previous run.")
 
@@ -959,11 +1088,26 @@ def main():
     print(f"✅ Baseline: {len(seen_snapshots)} products (with stock: {pdp_ok} | unknown: {pdp_none}).")
     print(f"🔄 Monitoring every {CHECK_INTERVAL}s. Press Ctrl+C to stop.\n")
 
+    # Start PDP background worker — handles all stock checks off the listing loop
+    threading.Thread(
+        target=pdp_worker,
+        args=(seen_snapshots, listing_map),
+        daemon=True
+    ).start()
+
     threading.Thread(
         target=telegram_listener,
         args=(seen_snapshots, listing_map),
         daemon=True
     ).start()
+
+    # Enqueue startup PDP checks for new/unknown products
+    for code in needs_pdp_init:
+        product = listing_map.get(code)
+        if product:
+            pdp_queue.put((code, product, "retry", None))
+    if needs_pdp_init:
+        print(f"  📥 Queued {len(needs_pdp_init)} PDP checks for background worker.")
 
     send_telegram(
         f"✅ <b>SHEIN Monitor Started</b>\n"
@@ -982,6 +1126,9 @@ def main():
         f"@CoBra_SR"
     )
 
+    # Tracks codes currently sitting in the PDP queue — avoids double-queuing
+    pdp_queued = set()
+
     while True:
         loop_start = time.time()
 
@@ -994,90 +1141,63 @@ def main():
         current_map   = {get_option_code(p): p for p in products}
         current_codes = set(current_map.keys())
 
-        # Codes never seen before
-        brand_new = current_codes - set(seen_snapshots.keys())
-        # Codes where baseline PDP failed (stored as None) — retry PDP this cycle
-        pdp_retry = {c for c in current_codes if seen_snapshots.get(c) is None}
-        # Codes that were absent and came back
-        returned  = current_codes & absent_codes
-        new_codes = brand_new  # only truly new codes get NEW alert
-        needs_pdp = brand_new | pdp_retry | returned
+        # Update listing_map with latest product data
+        listing_map.update(current_map)
 
-        pdp_results = {}
-        if needs_pdp:
-            t0 = time.time()
-            pdp_results = fetch_pdp_stocks_parallel(list(needs_pdp))
-            elapsed = time.time()-t0
-            for c in needs_pdp:
-                cat = "brand_new" if c in brand_new else ("pdp_retry" if c in pdp_retry else "returned")
-                snap = pdp_results.get(c)
-                print(f"\n  🔍 [{cat}] {c} → snap={snap}")
-            print(f"\n  🔍 PDP checked {len(needs_pdp)} in {elapsed:.1f}s")
+        with pdp_cache_lock:
+            cached_codes = set(seen_snapshots.keys())
 
-        alerts_sent = 0
+        # ── Only care about codes not yet in cache ────────────────────────────────
+        # brand_new  : never seen before
+        # returned   : was absent (dropped off listing), now back
+        # Both get queued for PDP — everything else already has a cached result
+        brand_new = current_codes - cached_codes
+        returned  = (current_codes & absent_codes) - pdp_queued
 
-        for code, product in current_map.items():
-            if code in brand_new:
-                # Truly new product — never seen before
-                new_snap = pdp_results.get(code, {})
-                if new_snap and has_any_stock(new_snap):
-                    display_snap = apply_monitor_filters(new_snap, product)
-                    if display_snap is not None:
-                        send_telegram(format_alert(product, "NEW", display_snap))
-                        print(f"\n[{datetime.now():%H:%M:%S}] 🆕 NEW: {product.get('name', code)}")
-                        alerts_sent += 1
-                    else:
-                        print(f"\n[{datetime.now():%H:%M:%S}] 🆕 NEW (filtered out): {product.get('name', code)}")
-                else:
-                    reason = "all sizes OOS" if new_snap == {} else "PDP failed — will retry"
-                    print(f"\n[{datetime.now():%H:%M:%S}] 🆕 NEW (skipped — {reason}): {product.get('name', code)}")
-                # Store None if PDP failed so we retry next cycle
-                seen_snapshots[code] = new_snap if new_snap else None
+        new_queued = 0
 
-            elif code in pdp_retry:
-                # Previously failed PDP — try again now
-                new_snap = pdp_results.get(code)
-                if new_snap is not None:
-                    if has_any_stock(new_snap):
-                        display_snap = apply_monitor_filters(new_snap, product)
-                        if display_snap is not None:
-                            # Stock found — alert as NEW since we never had valid data
-                            send_telegram(format_alert(product, "NEW", display_snap))
-                            print(f"\n[{datetime.now():%H:%M:%S}] 🆕 NEW (PDP recovered): {product.get('name', code)}")
-                            alerts_sent += 1
-                    seen_snapshots[code] = new_snap  # update with real data (even if empty)
-                # else PDP failed again — leave as None, will retry next cycle
+        for code in brand_new:
+            if code in pdp_queued:
+                continue   # already in queue, worker hasn't processed it yet
+            product = current_map[code]
+            # Mark immediately so next cycle doesn't re-detect it
+            with pdp_cache_lock:
+                seen_snapshots[code] = None   # None = PDP in progress
+            pdp_queued.add(code)
+            pdp_queue.put((code, product, "new", None))
+            new_queued += 1
+            print(f"\n[{datetime.now():%H:%M:%S}] 📥 New → PDP queued: {product.get('name', code)}")
 
-            elif code in returned:
-                new_snap = pdp_results.get(code, {})
-                old_snap = seen_snapshots.get(code) or {}
-                changed, change_lines = stock_increased(old_snap, new_snap)
-                if changed and has_any_stock(new_snap):
-                    display_snap = apply_monitor_filters(new_snap, product)
-                    if display_snap is not None:
-                        send_telegram(format_alert(product, "RESTOCK", display_snap, change_lines))
-                        print(f"\n[{datetime.now():%H:%M:%S}] 🔄 RESTOCK: {product.get('name', code)}")
-                        alerts_sent += 1
-                    else:
-                        print(f"\n[{datetime.now():%H:%M:%S}] 🔄 RESTOCK (filtered out): {product.get('name', code)}")
-                absent_codes.discard(code)
-                seen_snapshots[code] = new_snap
+        for code in returned:
+            product  = current_map[code]
+            old_snap = seen_snapshots.get(code) or {}
+            absent_codes.discard(code)
+            with pdp_cache_lock:
+                seen_snapshots[code] = None
+            pdp_queued.add(code)
+            pdp_queue.put((code, product, "returned", old_snap))
+            new_queued += 1
+            print(f"\n[{datetime.now():%H:%M:%S}] 🔄 Returned → PDP queued: {product.get('name', code)}")
 
-            listing_map[code] = product
+        # Track products that dropped off listing → mark absent
+        newly_absent = cached_codes - current_codes
+        absent_codes.update(newly_absent)
 
-        absent_codes.update(set(seen_snapshots.keys()) - current_codes)
-        save_state(seen_snapshots, absent_codes)
+        if brand_new or returned or newly_absent:
+            save_state(seen_snapshots, absent_codes)
 
         elapsed = time.time() - loop_start
-        if alerts_sent == 0:
+        qsize   = pdp_queue.qsize()
+        if new_queued == 0:
             msg = (
-                f"[{datetime.now():%H:%M:%S}] No changes. "
-                f"listing: {len(current_codes)} | absent: {len(absent_codes)} | "
-                f"cycle: {elapsed:.2f}s"
+                f"[{datetime.now():%H:%M:%S}] "
+                f"listing={len(current_codes)} cached={len(cached_codes)} "
+                f"absent={len(absent_codes)} pdp_q={qsize} cycle={elapsed:.3f}s"
             )
-            print(f"\r{msg:<80}", end="", flush=True)
+            print(f"\r{msg:<100}", end="", flush=True)
+        else:
+            print(f"[{datetime.now():%H:%M:%S}] 📥 {new_queued} queued | listing={len(current_codes)} cached={len(cached_codes)} pdp_q={qsize} cycle={elapsed:.3f}s")
 
-        # Sleep only the remaining time to maintain CHECK_INTERVAL cadence
         sleep_remaining = CHECK_INTERVAL - elapsed
         if sleep_remaining > 0:
             time.sleep(sleep_remaining)
