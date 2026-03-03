@@ -6,20 +6,9 @@ Run on PC/laptop (not Termux) — requires curl_cffi:
     pip install requests curl_cffi
 
 Default:  Monitors every 2s for NEW or RESTOCKED products → PDP stock check → alert if in stock
-
-Manual Scan Commands:
-  /check_existing   → scan ALL products (no filter)
-  /chex <sizes>     → scan with size filter e.g. /chex M L 38
-
-Monitor Filter Commands (persist until removed):
-  /filter <sizes>   → only alert for NEW/RESTOCK that have these sizes e.g. /filter M L
-  /filterout <sizes>→ suppress alerts for products with these sizes e.g. /filterout 38
-  /rfilter          → remove all /filter sizes
-  /rfilterout       → remove all /filterout sizes
-  /chstat           → show current filter status
-
-Other:
-  /help             → full command guide
+Commands: /check_existing   → scan ALL products (no filter)
+          /chex <sizes>    → scan with size filter e.g. /chex M L 38
+          /help            → command guide
 """
 
 import requests
@@ -28,13 +17,8 @@ import time
 import sys
 import threading
 import random
-import socket
-import os
-from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from requests.adapters import HTTPAdapter
-from urllib3.util.connection import create_connection as _orig_create_connection
 
 try:
     from curl_cffi import requests as cffi_requests
@@ -45,64 +29,18 @@ except ImportError:
     print("⚠️  curl_cffi not installed. Run: pip install curl_cffi")
     print("    PDP requests may get 403 without it.")
 
-
-# ── IPv4 / IPv6 TRANSPORT ──────────────────────────────────────────────────────
-# All listing + Telegram calls → IPv6 (default OS preference if available)
-# PDP calls → force IPv4 to avoid Akamai blocks on IPv6
-
-class IPv4HTTPAdapter(HTTPAdapter):
-    """Forces all connections through IPv4 (AF_INET)."""
-    def send(self, request, *args, **kwargs):
-        # Temporarily monkey-patch socket.getaddrinfo to return only IPv4
-        _orig = socket.getaddrinfo
-        def _ipv4_only(host, port, family=0, *a, **kw):
-            return _orig(host, port, socket.AF_INET, *a, **kw)
-        socket.getaddrinfo = _ipv4_only
-        try:
-            return super().send(request, *args, **kwargs)
-        finally:
-            socket.getaddrinfo = _orig
-
-def make_ipv4_session() -> requests.Session:
-    """Returns a requests.Session that always connects over IPv4."""
-    s = requests.Session()
-    adapter = IPv4HTTPAdapter()
-    s.mount("http://", adapter)
-    s.mount("https://", adapter)
-    return s
-
-def make_ipv6_session() -> requests.Session:
-    """Returns a plain requests.Session — uses OS default (prefers IPv6 if available)."""
-    return requests.Session()
-
-# Global IPv6 session for listing + Telegram (shared, thread-safe for reads)
-_ipv6_session = make_ipv6_session()
-
-# Thread-local storage — each PDP thread gets its own persistent curl_cffi session (IPv4)
+# Thread-local storage — each thread gets its own persistent curl_cffi session
+# This reuses TLS connections instead of handshaking on every request
 _thread_local = threading.local()
 
 def get_cffi_session():
-    """
-    Get or create a persistent curl_cffi session for the current thread.
-    curl_options={CurlOpt.IPRESOLVE: 1} is set at Session() creation time —
-    that's the correct API in 0.14.x (it's a Session-level param, not per-request).
-    CURL_IPRESOLVE_V4 = 1 forces all connections to use IPv4 only.
-    """
+    """Get or create a persistent curl_cffi session for the current thread."""
     if not hasattr(_thread_local, "session"):
         if USE_CFFI:
-            from curl_cffi.curl import CurlOpt
-            _thread_local.session = cffi_requests.Session(
-                impersonate="chrome110",
-                curl_options={CurlOpt.IPRESOLVE: 1},   # IPv4 only
-            )
+            _thread_local.session = cffi_requests.Session(impersonate="chrome110")
         else:
-            _thread_local.session = make_ipv4_session()
+            _thread_local.session = requests.Session()
     return _thread_local.session
-
-
-def pdp_get_ipv4(session, url, **kwargs):
-    """Thin wrapper — IPv4 is already baked into the session at creation time."""
-    return session.get(url, **kwargs)
 
 # ── CONFIG ─────────────────────────────────────────────────────────────────────
 BOT_TOKEN      = "8679800339:AAH1uKwHey2l7tCyl3GPbJW0wzwCzS81I4w"
@@ -150,24 +88,12 @@ HEADERS = {
 check_existing_lock    = threading.Lock()
 check_existing_running = False
 
-# ── MONITOR FILTERS (persistent across cycles) ────────────────────────────────────
-# /filter      : only alert for products that have AT LEAST ONE of these sizes in stock
-# /filterout   : hide these sizes from alerts (suppress if no other sizes remain)
-# /filterprice : suppress products whose price exceeds this value
-# /flrange     : only alert for products whose price is within [min, max]
-monitor_filter_sizes     = set()    # empty = no filter (show all)
-monitor_filterout_sizes  = set()    # empty = no filterout
-monitor_price_max        = None     # None = no upper price cap
-monitor_price_range      = None     # None = no range; tuple (min, max) when set
-monitor_filters_lock     = threading.Lock()
-
 
 # ── LISTING FETCH (PARALLEL) ──────────────────────────────────────────────────
 
 def fetch_listing_page(page: int):
     params = {**LISTING_PARAMS, "currentPage": page}
-    # IPv6 session — keeps listing traffic on a different IP than PDP
-    resp = _ipv6_session.get(LISTING_URL, params=params, headers=HEADERS, timeout=15)
+    resp = requests.get(LISTING_URL, params=params, headers=HEADERS, timeout=15)
     resp.raise_for_status()
     data = resp.json()
     return page, data.get("products", []), data.get("pagination", {}).get("totalPages", 1)
@@ -206,17 +132,13 @@ def fetch_all_listing_products(silent=False):
 def fetch_pdp_stock(option_code: str) -> dict:
     """
     Returns {size: stock_level} for all sizes with stock > 0.
-    Uses curl_cffi with Chrome TLS fingerprint + forced IPv4 to bypass Akamai 403.
-    IPv4 is intentional — PDP endpoint blocks IPv6 more aggressively.
+    Uses curl_cffi with Chrome TLS fingerprint to bypass Akamai 403.
     """
     url = f"{PDP_BASE}/{option_code}"
     for attempt in range(3):
         try:
             session = get_cffi_session()
-            if USE_CFFI:
-                resp = pdp_get_ipv4(session, url, params=PDP_PARAMS, headers=HEADERS, timeout=15)
-            else:
-                resp = session.get(url, params=PDP_PARAMS, headers=HEADERS, timeout=15)
+            resp = session.get(url, params=PDP_PARAMS, headers=HEADERS, timeout=15)
 
             if resp.status_code == 403:
                 print(f"  [PDP 403] {option_code} — attempt {attempt+1}/3")
@@ -294,8 +216,7 @@ def send_telegram(message: str, chat_id: str = None):
         "disable_web_page_preview": False,
     }
     try:
-        # IPv6 session — Telegram traffic separate from PDP IPv4
-        resp = _ipv6_session.post(url, json=payload, timeout=10)
+        resp = requests.post(url, json=payload, timeout=10)
         if not resp.ok:
             print(f"[TG ERROR] {resp.status_code}: {resp.text}")
     except Exception as e:
@@ -304,7 +225,7 @@ def send_telegram(message: str, chat_id: str = None):
 
 def get_telegram_updates(offset: int) -> list:
     try:
-        resp = _ipv6_session.get(
+        resp = requests.get(
             f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates",
             params={"offset": offset, "timeout": 1},
             timeout=5,
@@ -393,74 +314,6 @@ def stock_increased(old_snap: dict, new_snap: dict):
     return len(changes) > 0, changes
 
 
-# ── PRICE EXTRACTION HELPER ──────────────────────────────────────────────────────
-
-def get_product_price(product: dict):
-    """
-    Extract numeric price from a product dict.
-    Tries offerPrice first (discounted), then regular price.
-    Returns float or None if unparseable.
-    """
-    import re
-    for key in ("offerPrice", "price"):
-        data = product.get(key, {})
-        raw  = data.get("value") or data.get("displayformattedValue") or data.get("formattedValue", "")
-        if isinstance(raw, (int, float)):
-            return float(raw)
-        if isinstance(raw, str):
-            cleaned = re.sub(r"[^\d.]", "", raw)
-            if cleaned:
-                try:
-                    return float(cleaned)
-                except ValueError:
-                    pass
-    return None
-
-
-# ── MONITOR FILTER HELPER ────────────────────────────────────────────────────────
-
-def apply_monitor_filters(size_stock: dict, product: dict = None):
-    """
-    Returns a (possibly trimmed) size_stock dict to display, or None if filtered out entirely.
-    Logic:
-      - filterprice  → suppress if product price > max
-      - flrange      → suppress if product price outside [min, max]
-      - filterout    → hide those sizes; suppress if nothing remains
-      - filter       → only show matching sizes; suppress if none match
-    """
-    with monitor_filters_lock:
-        fin        = set(monitor_filter_sizes)
-        fout       = set(monitor_filterout_sizes)
-        price_max  = monitor_price_max
-        price_rng  = monitor_price_range
-
-    # price filters
-    if product is not None and (price_max is not None or price_rng is not None):
-        price = get_product_price(product)
-        if price is not None:
-            if price_max is not None and price > price_max:
-                return None
-            if price_rng is not None:
-                lo, hi = price_rng
-                if not (lo <= price <= hi):
-                    return None
-
-    # filterout sizes
-    if fout:
-        size_stock = {s: q for s, q in size_stock.items() if s.upper() not in fout}
-        if not size_stock:
-            return None
-
-    # filter sizes
-    if fin:
-        matched = {s: q for s, q in size_stock.items() if s.upper() in fin and q > 0}
-        if not matched:
-            return None
-        return matched
-
-    return size_stock
-
-
 # ── SCAN HANDLER ─────────────────────────────────────────────────────────────────
 
 def run_scan(chat_id: str, size_filter: list = None):
@@ -538,6 +391,7 @@ def telegram_listener(seen_snapshots: dict, listing_map: dict):
     print(f"[{datetime.now():%H:%M:%S}] 🤖 Telegram command listener started.")
 
     while True:
+        global check_existing_running
         updates = get_telegram_updates(offset)
         for update in updates:
             offset  = update["update_id"] + 1
@@ -548,13 +402,13 @@ def telegram_listener(seen_snapshots: dict, listing_map: dict):
             if not text or not chat_id:
                 continue
 
-            # ── /check_existing → scan ALL, no filter ────────────────────────────
-            if text == "/check_existing" or text == "/chex":
+            # /check_existing → scan ALL, no filter
+            if text == "/check_existing":
                 print(f"[{datetime.now():%H:%M:%S}] 📥 /check_existing from {chat_id}")
                 handle_check_existing(chat_id, size_filter=None)
 
-            # ── /chex <sizes> → scan with size filter ────────────────────────────
-            elif text.startswith("/chex "):
+            # /chex <sizes> → scan with size filter e.g. /chex M L 38
+            elif text.startswith("/chex"):
                 parts = text[len("/chex"):].strip()
                 sizes = [s.strip().upper() for s in parts.replace(",", " ").split() if s.strip()]
                 if not sizes:
@@ -567,249 +421,6 @@ def telegram_listener(seen_snapshots: dict, listing_map: dict):
                     print(f"[{datetime.now():%H:%M:%S}] 📐 /chex {sizes} from {chat_id}")
                     handle_check_existing(chat_id, size_filter=sizes)
 
-            # ── /filterout <sizes> — MUST come before /filter check ───────────────
-            elif text.startswith("/filterout"):
-                parts = text[len("/filterout"):].strip()
-                sizes = [s.strip().upper() for s in parts.replace(",", " ").split() if s.strip()]
-                if not sizes:
-                    send_telegram(
-                        "⚠️ Please include sizes after /filterout\n"
-                        "Example: <code>/filterout 38 40</code>",
-                        chat_id
-                    )
-                else:
-                    with monitor_filters_lock:
-                        monitor_filterout_sizes.update(sizes)
-                    current = sorted(monitor_filterout_sizes)
-                    send_telegram(
-                        f"🚫 <b>Filter-out set</b>\n"
-                        f"❌ Hiding sizes from alerts: <b>{', '.join(current)}</b>\n"
-                        f"Products with ONLY these sizes will be suppressed.\n"
-                        f"Products with other sizes will still alert (filtered sizes hidden).\n\n"
-                        f"Use /rfilterout to remove.\n"
-                        f"@CoBra_SR",
-                        chat_id
-                    )
-                    print(f"[{datetime.now():%H:%M:%S}] 🚫 /filterout set: {current}")
-
-            # ── /filter <sizes> → only alert when product has these sizes ─────────
-            elif text.startswith("/filter"):
-                parts = text[len("/filter"):].strip()
-                sizes = [s.strip().upper() for s in parts.replace(",", " ").split() if s.strip()]
-                if not sizes:
-                    send_telegram(
-                        "⚠️ Please include sizes after /filter\n"
-                        "Example: <code>/filter M L XL</code> or <code>/filter 38 40</code>",
-                        chat_id
-                    )
-                else:
-                    with monitor_filters_lock:
-                        monitor_filter_sizes.update(sizes)
-                    current = sorted(monitor_filter_sizes)
-                    send_telegram(
-                        f"✅ <b>Monitor filter set</b>\n"
-                        f"🔍 Only alerting for sizes: <b>{', '.join(current)}</b>\n\n"
-                        f"Use /rfilter to remove these filters.\n"
-                        f"@CoBra_SR",
-                        chat_id
-                    )
-                    print(f"[{datetime.now():%H:%M:%S}] 🔍 /filter set: {current}")
-
-            # ── /rfilterout [sizes] → remove specific or all filterout sizes ──────
-            elif text.startswith("/rfilterout"):
-                parts = text[len("/rfilterout"):].strip()
-                sizes = [s.strip().upper() for s in parts.replace(",", " ").split() if s.strip()]
-                with monitor_filters_lock:
-                    if sizes:
-                        removed = [s for s in sizes if s in monitor_filterout_sizes]
-                        monitor_filterout_sizes.difference_update(sizes)
-                        remaining = sorted(monitor_filterout_sizes)
-                        rm_str = ", ".join(removed) if removed else "nothing matched"
-                        rem_str = ", ".join(remaining) if remaining else "None"
-                        send_telegram(
-                            f"✅ <b>Filter-out updated</b>\n"
-                            f"🗑️ Removed: <b>{rm_str}</b>\n"
-                            f"📋 Still filtered-out: <b>{rem_str}</b>\n"
-                            f"@CoBra_SR",
-                            chat_id
-                        )
-                    else:
-                        removed = sorted(monitor_filterout_sizes)
-                        monitor_filterout_sizes.clear()
-                        send_telegram(
-                            f"✅ <b>All filter-outs cleared</b>\n"
-                            f"🔓 Removed: <b>{', '.join(removed) if removed else 'none was set'}</b>\n"
-                            f"Now showing all sizes in alerts.\n"
-                            f"@CoBra_SR",
-                            chat_id
-                        )
-                print(f"[{datetime.now():%H:%M:%S}] 🔓 /rfilterout sizes={sizes or 'ALL'}")
-
-            # ── /rfilter [sizes] → remove specific or all filter sizes ───────────
-            elif text.startswith("/rfilter"):
-                parts = text[len("/rfilter"):].strip()
-                sizes = [s.strip().upper() for s in parts.replace(",", " ").split() if s.strip()]
-                with monitor_filters_lock:
-                    if sizes:
-                        removed = [s for s in sizes if s in monitor_filter_sizes]
-                        monitor_filter_sizes.difference_update(sizes)
-                        remaining = sorted(monitor_filter_sizes)
-                        rm_str = ", ".join(removed) if removed else "nothing matched"
-                        rem_str = ", ".join(remaining) if remaining else "None (alerting all sizes)"
-                        send_telegram(
-                            f"✅ <b>Filter updated</b>\n"
-                            f"🗑️ Removed: <b>{rm_str}</b>\n"
-                            f"📋 Still filtering for: <b>{rem_str}</b>\n"
-                            f"@CoBra_SR",
-                            chat_id
-                        )
-                    else:
-                        removed = sorted(monitor_filter_sizes)
-                        monitor_filter_sizes.clear()
-                        send_telegram(
-                            f"✅ <b>All filters cleared</b>\n"
-                            f"🔓 Removed: <b>{', '.join(removed) if removed else 'none was set'}</b>\n"
-                            f"Now alerting for all sizes.\n"
-                            f"@CoBra_SR",
-                            chat_id
-                        )
-                print(f"[{datetime.now():%H:%M:%S}] 🔓 /rfilter sizes={sizes or 'ALL'}")
-
-            # ── /filterprice <amount> → suppress products above this price ─────
-            elif text.startswith("/filterprice"):
-                parts = text[len("/filterprice"):].strip()
-                if not parts:
-                    send_telegram(
-                        "⚠️ Please include a price after /filterprice\n"
-                        "Example: <code>/filterprice 600</code>",
-                        chat_id
-                    )
-                else:
-                    try:
-                        max_price = float(parts.replace(",", "").strip())
-                        with monitor_filters_lock:
-                            monitor_price_max   = max_price
-                            monitor_price_range = None   # clear range if set
-                        send_telegram(
-                            f"💰 <b>Price filter set</b>\n"
-                            f"🔽 Only alerting for products <b>≤ ₹{max_price:,.0f}</b>\n"
-                            f"Products above this price will be skipped.\n\n"
-                            f"Use /rflprice to remove.\n"
-                            f"@CoBra_SR",
-                            chat_id
-                        )
-                        print(f"[{{datetime.now():%H:%M:%S}}] 💰 /filterprice set: ≤{max_price}")
-                    except ValueError:
-                        send_telegram("❌ Invalid price. Example: <code>/filterprice 600</code>", chat_id)
-
-            # ── /flrange <min> <max> → only alert within price range ─────────────
-            elif text.startswith("/flrange"):
-                parts = text[len("/flrange"):].strip()
-                nums  = [x.replace(",", "").strip() for x in parts.split()]
-                if len(nums) != 2:
-                    send_telegram(
-                        "⚠️ Please include min and max prices after /flrange\n"
-                        "Example: <code>/flrange 100 300</code>",
-                        chat_id
-                    )
-                else:
-                    try:
-                        lo, hi = float(nums[0]), float(nums[1])
-                        if lo > hi:
-                            lo, hi = hi, lo
-                        with monitor_filters_lock:
-                            monitor_price_range = (lo, hi)
-                            monitor_price_max   = None   # clear max if set
-                        send_telegram(
-                            f"💰 <b>Price range set</b>\n"
-                            f"🔁 Only alerting for products between <b>₹{lo:,.0f} – ₹{hi:,.0f}</b>\n"
-                            f"Products outside this range will be skipped.\n\n"
-                            f"Use /rflprice to remove.\n"
-                            f"@CoBra_SR",
-                            chat_id
-                        )
-                        print(f"[{{datetime.now():%H:%M:%S}}] 💰 /flrange set: {lo}–{hi}")
-                    except ValueError:
-                        send_telegram("❌ Invalid prices. Example: <code>/flrange 100 300</code>", chat_id)
-
-            # ── /rflprice → remove price filter (both filterprice and flrange) ───
-            elif text == "/rflprice":
-                with monitor_filters_lock:
-                    had_max   = monitor_price_max
-                    had_range = monitor_price_range
-                    monitor_price_max   = None
-                    monitor_price_range = None
-                if had_max is not None:
-                    removed_str = f"max price ≤ ₹{had_max:,.0f}"
-                elif had_range is not None:
-                    removed_str = f"range ₹{had_range[0]:,.0f} – ₹{had_range[1]:,.0f}"
-                else:
-                    removed_str = "none was set"
-                send_telegram(
-                    f"✅ <b>Price filter cleared</b>\n"
-                    f"🔓 Removed: <b>{removed_str}</b>\n"
-                    f"Now alerting for all price ranges.\n"
-                    f"@CoBra_SR",
-                    chat_id
-                )
-                print(f"[{{datetime.now():%H:%M:%S}}] 🔓 /rflprice cleared")
-
-            # ── /flstat → show all active filters ────────────────────────────────
-            elif text == "/flstat":
-                with monitor_filters_lock:
-                    fin        = sorted(monitor_filter_sizes)
-                    fout       = sorted(monitor_filterout_sizes)
-                    price_max  = monitor_price_max
-                    price_rng  = monitor_price_range
-
-                filter_str    = ", ".join(fin)  if fin  else "None (all sizes)"
-                filterout_str = ", ".join(fout) if fout else "None"
-                if price_max is not None:
-                    price_str = f"≤ ₹{price_max:,.0f}  (/filterprice)"
-                elif price_rng is not None:
-                    price_str = f"₹{price_rng[0]:,.0f} – ₹{price_rng[1]:,.0f}  (/flrange)"
-                else:
-                    price_str = "None (all prices)"
-
-                send_telegram(
-                    f"🔧 <b>Active Filter Status</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"✅ Size filter:       <b>{filter_str}</b>\n"
-                    f"🚫 Size filter-out:  <b>{filterout_str}</b>\n"
-                    f"💰 Price filter:     <b>{price_str}</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"/rfilter [size] — remove size filter\n"
-                    f"/rfilterout [size] — remove filterout\n"
-                    f"/rflprice — remove price filter\n"
-                    f"@CoBra_SR",
-                    chat_id
-                )
-                print(f"[{{datetime.now():%H:%M:%S}}] 🔧 /flstat from {chat_id}")
-
-            # ── /chstat → live stock snapshot from seen_snapshots ────────────────
-            elif text == "/chstat":
-                total     = len(seen_snapshots)
-                in_stock  = sum(1 for v in seen_snapshots.values() if v and has_any_stock(v))
-                oos       = sum(1 for v in seen_snapshots.values() if v is not None and not has_any_stock(v))
-                unknown   = sum(1 for v in seen_snapshots.values() if v is None)
-                scan_status = "🔄 Running" if check_existing_running else "✅ Idle"
-
-                send_telegram(
-                    f"📊 <b>Current Stock Status</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"📦 Total tracked:    <b>{total}</b>\n"
-                    f"🟢 In stock:         <b>{in_stock}</b>\n"
-                    f"⚫ Out of stock:     <b>{oos}</b>\n"
-                    f"❓ Unknown (PDP ❌): <b>{unknown}</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"🔎 Manual scan:      {scan_status}\n"
-                    f"Use /chex or /check_existing to deep scan\n"
-                    f"Use /flstat to see active filters\n"
-                    f"@CoBra_SR",
-                    chat_id
-                )
-                print(f"[{{datetime.now():%H:%M:%S}}] 📊 /chstat from {chat_id}")
-
             elif text in ("/start", "/help"):
                 send_telegram(
                     "👋 <b>SHEIN Men's Monitor Bot</b>\n\n"
@@ -818,35 +429,15 @@ def telegram_listener(seen_snapshots: dict, listing_map: dict):
                     "  🔄 Restocked products\n"
                     "  📈 Stock increases\n\n"
                     "━━━━━━━━━━━━━━━━━━\n"
-                    "<b>📦 Manual Scan:</b>\n\n"
-                    "/check_existing — scan all products\n"
-                    "/chex M L 38 — scan by size\n\n"
-                    "━━━━━━━━━━━━━━━━━━\n"
-                    "<b>📐 Size Filters:</b>\n\n"
-                    "/filter &lt;sizes&gt;\n"
-                    "  Alert ONLY if product has these sizes\n"
-                    "  <code>/filter M L XL</code>\n\n"
-                    "/filterout &lt;sizes&gt;\n"
-                    "  Hide these sizes from alerts\n"
-                    "  (still alerts if other sizes exist)\n"
-                    "  <code>/filterout 38 40</code>\n\n"
-                    "/rfilter — clear all size filters\n"
-                    "/rfilter M — remove only M\n\n"
-                    "/rfilterout — clear all filterouts\n"
-                    "/rfilterout 38 — remove only 38\n\n"
-                    "━━━━━━━━━━━━━━━━━━\n"
-                    "<b>💰 Price Filters:</b>\n\n"
-                    "/filterprice &lt;amount&gt;\n"
-                    "  Only alert for products ≤ price\n"
-                    "  <code>/filterprice 600</code>\n\n"
-                    "/flrange &lt;min&gt; &lt;max&gt;\n"
-                    "  Only alert within price range\n"
-                    "  <code>/flrange 100 300</code>\n\n"
-                    "/rflprice — remove price filter\n\n"
-                    "━━━━━━━━━━━━━━━━━━\n"
-                    "<b>📊 Status Commands:</b>\n\n"
-                    "/chstat — live stock count\n"
-                    "/flstat — all active filters\n\n"
+                    "<b>Commands:</b>\n\n"
+                    "📦 /check_existing\n"
+                    "    Scan ALL current products\n"
+                    "    Shows every in-stock item\n\n"
+                    "🔍 /chex &lt;sizes&gt;\n"
+                    "    Scan filtered by size\n"
+                    "    <code>/chex M L XL</code>\n"
+                    "    <code>/chex 30 32 38</code>\n"
+                    "    <code>/chex M 38 XXL</code>\n\n"
                     "━━━━━━━━━━━━━━━━━━\n"
                     "Size icons:\n"
                     "  🔴 1–3 units  🟡 4–10  🟢 11+\n\n"
@@ -891,38 +482,12 @@ def load_state() -> tuple:
         print(f"[STATE] Load failed ({e}) — starting fresh.")
         return {}, set()
 
-# ── RAILWAY HEALTH CHECK SERVER ───────────────────────────────────────────────
-
-class _HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
-    def log_message(self, *args):
-        pass  # suppress HTTP access logs
-
-def start_health_server():
-    """
-    Starts a minimal HTTP server on $PORT (Railway injects this env var).
-    Railway requires something to respond on that port or it marks the deploy failed.
-    Runs in a daemon thread — won't block or interfere with the monitor.
-    """
-    port = int(os.environ.get("PORT", 8080))
-    server = HTTPServer(("0.0.0.0", port), _HealthHandler)
-    t = threading.Thread(target=server.serve_forever, daemon=True)
-    t.start()
-    print(f"✅ Health check server listening on port {port}")
-
-
 # ── MAIN ────────────────────────────────────────────────────────────────────────
 
 def main():
     print("=" * 60)
     print("  SHEIN Men's Category Monitor  |  @CoBra_SR")
     print("=" * 60)
-
-    # Start Railway health check server first (required or deploy fails)
-    start_health_server()
 
     # Load previous state first
     seen_snapshots, absent_codes = load_state()
@@ -972,23 +537,14 @@ def main():
         f"⏱️ Interval: {CHECK_INTERVAL}s\n"
         f"💬 /check_existing — scan all stock\n"
         f"💬 /chex M L 38 — scan by size\n"
-        f"💬 /filter M — only alert this size\n"
-        f"💬 /filterout 38 — hide this size\n"
-        f"💬 /filterprice 600 — max price filter\n"
-        f"💬 /flrange 100 300 — price range filter\n"
-        f"💬 /chstat — stock status\n"
-        f"💬 /flstat — active filters\n"
-        f"💬 /help — full command guide\n"
         f"@CoBra_SR"
     )
 
     while True:
-        loop_start = time.time()
+        time.sleep(CHECK_INTERVAL)
 
         products = fetch_all_listing_products(silent=True)
         if products is None:
-            elapsed = time.time() - loop_start
-            time.sleep(max(0, CHECK_INTERVAL - elapsed))
             continue
 
         current_map   = {get_option_code(p): p for p in products}
@@ -1021,13 +577,9 @@ def main():
                 # Truly new product — never seen before
                 new_snap = pdp_results.get(code, {})
                 if new_snap and has_any_stock(new_snap):
-                    display_snap = apply_monitor_filters(new_snap, product)
-                    if display_snap is not None:
-                        send_telegram(format_alert(product, "NEW", display_snap))
-                        print(f"\n[{datetime.now():%H:%M:%S}] 🆕 NEW: {product.get('name', code)}")
-                        alerts_sent += 1
-                    else:
-                        print(f"\n[{datetime.now():%H:%M:%S}] 🆕 NEW (filtered out): {product.get('name', code)}")
+                    send_telegram(format_alert(product, "NEW", new_snap))
+                    print(f"\n[{datetime.now():%H:%M:%S}] 🆕 NEW: {product.get('name', code)}")
+                    alerts_sent += 1
                 else:
                     reason = "all sizes OOS" if new_snap == {} else "PDP failed — will retry"
                     print(f"\n[{datetime.now():%H:%M:%S}] 🆕 NEW (skipped — {reason}): {product.get('name', code)}")
@@ -1039,12 +591,10 @@ def main():
                 new_snap = pdp_results.get(code)
                 if new_snap is not None:
                     if has_any_stock(new_snap):
-                        display_snap = apply_monitor_filters(new_snap, product)
-                        if display_snap is not None:
-                            # Stock found — alert as NEW since we never had valid data
-                            send_telegram(format_alert(product, "NEW", display_snap))
-                            print(f"\n[{datetime.now():%H:%M:%S}] 🆕 NEW (PDP recovered): {product.get('name', code)}")
-                            alerts_sent += 1
+                        # Stock found — alert as NEW since we never had valid data
+                        send_telegram(format_alert(product, "NEW", new_snap))
+                        print(f"\n[{datetime.now():%H:%M:%S}] 🆕 NEW (PDP recovered): {product.get('name', code)}")
+                        alerts_sent += 1
                     seen_snapshots[code] = new_snap  # update with real data (even if empty)
                 # else PDP failed again — leave as None, will retry next cycle
 
@@ -1053,13 +603,9 @@ def main():
                 old_snap = seen_snapshots.get(code) or {}
                 changed, change_lines = stock_increased(old_snap, new_snap)
                 if changed and has_any_stock(new_snap):
-                    display_snap = apply_monitor_filters(new_snap, product)
-                    if display_snap is not None:
-                        send_telegram(format_alert(product, "RESTOCK", display_snap, change_lines))
-                        print(f"\n[{datetime.now():%H:%M:%S}] 🔄 RESTOCK: {product.get('name', code)}")
-                        alerts_sent += 1
-                    else:
-                        print(f"\n[{datetime.now():%H:%M:%S}] 🔄 RESTOCK (filtered out): {product.get('name', code)}")
+                    send_telegram(format_alert(product, "RESTOCK", new_snap, change_lines))
+                    print(f"\n[{datetime.now():%H:%M:%S}] 🔄 RESTOCK: {product.get('name', code)}")
+                    alerts_sent += 1
                 absent_codes.discard(code)
                 seen_snapshots[code] = new_snap
 
@@ -1068,19 +614,12 @@ def main():
         absent_codes.update(set(seen_snapshots.keys()) - current_codes)
         save_state(seen_snapshots, absent_codes)
 
-        elapsed = time.time() - loop_start
         if alerts_sent == 0:
             msg = (
                 f"[{datetime.now():%H:%M:%S}] No changes. "
-                f"listing: {len(current_codes)} | absent: {len(absent_codes)} | "
-                f"cycle: {elapsed:.2f}s"
+                f"listing: {len(current_codes)} | absent: {len(absent_codes)}"
             )
-            print(f"\r{msg:<80}", end="", flush=True)
-
-        # Sleep only the remaining time to maintain CHECK_INTERVAL cadence
-        sleep_remaining = CHECK_INTERVAL - elapsed
-        if sleep_remaining > 0:
-            time.sleep(sleep_remaining)
+            print(f"\r{msg:<70}", end="", flush=True)
 
 
 if __name__ == "__main__":
