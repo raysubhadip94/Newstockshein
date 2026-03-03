@@ -1,11 +1,7 @@
 #!/usr/bin/env python3
 """
-SHEIN Monitor - Final Fixed Version
-- Shows actual price (not offer price)
-- Doesn't alert out of stock
-- Clean product ID (no color)
-- Clean size format
-- Individual product messages
+SHEIN Monitor - Final Improved Version
+Handles out-of-stock products properly
 """
 
 import requests
@@ -29,11 +25,12 @@ def make_session():
 
 session = make_session()
 
+# CONFIG
 BOT_TOKEN      = "8679800339:AAH1uKwHey2l7tCyl3GPbJW0wzwCzS81I4w"
 CHAT_ID        = "1276512925"
 CHECK_INTERVAL = 1
 BASE_URL       = "https://sheinindia.in"
-STATE_FILE     = "shein_state.json"
+STATE_FILE     = "shein_state_final.json"
 
 LISTING_URL = "https://search-edge.services.sheinindia.in/rilfnlwebservices/v4/rilfnl/products/category/sverse-5939-37961"
 LISTING_PARAMS = {
@@ -58,18 +55,28 @@ HEADERS = {
     "Accept-Encoding": "gzip, deflate, br",
 }
 
+# Track stock history for restock detection
 stock_history = {}
 stock_history_lock = threading.Lock()
+
+# PDP cache
 pdp_cache = {}
 pdp_cache_lock = threading.Lock()
-all_products_map = {}
-all_products_lock = threading.Lock()
 
-filter_sizes = set()
-filterout_sizes = set()
-filter_price_max = None
-filter_price_range = None
-filter_lock = threading.Lock()
+# Product status tracking
+product_status = {}  # {code: "in_stock" | "out_of_stock"}
+product_status_lock = threading.Lock()
+
+# Stats
+stats = {
+    "listing_calls": 0,
+    "pdp_calls": 0,
+    "last_check": None,
+    "new_products": 0,
+    "restocks": 0,
+    "out_of_stock": 0,
+}
+stats_lock = threading.Lock()
 
 def send_telegram(message: str):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -96,9 +103,13 @@ def start_health_server():
         pass
 
 def fetch_pdp_with_curl(color_group: str) -> dict:
+    """Fetch PDP using curl"""
     with pdp_cache_lock:
         if color_group in pdp_cache:
             return pdp_cache[color_group]
+    
+    with stats_lock:
+        stats["pdp_calls"] += 1
     
     try:
         pdp_url = f"{PDP_BASE}/{color_group}?storeId=shein&sortOptionsByColor=true&client_type=Android/32&client_version=1.0.14&isNewUser=true&pincode=110001&tagVersionTwo=false&applyExperiment=false&fields=FULL"
@@ -152,7 +163,8 @@ def fetch_pdp_with_curl(color_group: str) -> dict:
             pdp_cache[color_group] = size_stock
         
         return size_stock
-    except:
+    
+    except Exception as e:
         return {}
 
 def fetch_listing_page(page: int = 0):
@@ -169,6 +181,9 @@ def fetch_listing_page(page: int = 0):
 
 def fetch_all_listing_products(silent: bool = False):
     try:
+        with stats_lock:
+            stats["listing_calls"] += 1
+        
         t0 = time.time()
         page, first_products, total_pages = fetch_listing_page(0)
         
@@ -194,26 +209,18 @@ def fetch_all_listing_products(silent: bool = False):
         return None
 
 def get_option_code(product: dict) -> str:
-    """Get colorGroup which is like 443385648_olivegreen"""
     return product.get("fnlColorVariantData", {}).get("colorGroup") or product["code"]
 
-def get_product_id(product: dict) -> str:
-    """Extract just the number part like 443385648"""
-    code = get_option_code(product)
-    return code.split("_")[0]  # Split by underscore and take first part
-
-def get_stock_icon(count: int) -> str:
-    if count <= 3:
-        return "🔴"
-    elif count <= 10:
-        return "🟡"
-    else:
-        return "🟢"
+filter_sizes = set()
+filterout_sizes = set()
+filter_price_max = None
+filter_price_range = None
+filter_lock = threading.Lock()
 
 def apply_size_filter(sizes: dict) -> bool:
     with filter_lock:
         if not sizes:
-            return False
+            return False  # No sizes = don't alert (out of stock)
         if filter_sizes and not (set(sizes.keys()) & filter_sizes):
             return False
         if filterout_sizes and (set(sizes.keys()) & filterout_sizes):
@@ -221,13 +228,7 @@ def apply_size_filter(sizes: dict) -> bool:
     return True
 
 def apply_price_filter(product: dict) -> bool:
-    # Use actual price (not offer price)
-    price = product.get("price", {})
-    if isinstance(price, dict):
-        price = price.get("value", 0)
-    else:
-        price = float(price or 0)
-    
+    price = product.get("offerPrice", {}).get("value", 0)
     with filter_lock:
         if filter_price_max and price > filter_price_max:
             return False
@@ -253,9 +254,105 @@ def load_state():
         pass
     return set()
 
-def telegram_listener():
-    global filter_sizes, filterout_sizes, filter_price_max, filter_price_range
+def format_new_alert(product: dict, sizes: dict) -> str:
+    """Format NEW product alert"""
+    code = get_option_code(product)
+    name = product.get("name", "Unknown")
+    price = product.get("offerPrice", {}).get("displayformattedValue", "N/A")
     
+    # Format sizes with counts
+    size_lines = ""
+    total_units = 0
+    if sizes:
+        for size in sorted(sizes.keys()):
+            count = sizes[size]
+            total_units += count
+            size_lines += f"  🔴 {size}: {count} Unit(s)\n"
+    else:
+        # OUT OF STOCK
+        return f"""🚨 NEW PRODUCT [OUT OF STOCK]
+
+🏷️ {name}
+🆔 Product ID: {code}
+
+💰 Price: {price}
+
+❌ <b>Currently Out of Stock</b>
+
+🔗 {BASE_URL}/p/{code}
+
+@CoBra_SR"""
+    
+    msg = f"🚨 NEW PRODUCT [NEW]\n\n"
+    msg += f"🏷️ {name}\n"
+    msg += f"🆔 Product ID: {code}\n\n"
+    msg += f"💰 Price: {price}\n\n"
+    msg += f"📊 Size Availability ({total_units} total):\n"
+    msg += size_lines
+    msg += f"🔗 {BASE_URL}/p/{code}\n\n"
+    msg += f"@CoBra_SR"
+    
+    return msg
+
+def format_restock_alert(product: dict, old_sizes: dict, new_sizes: dict) -> str:
+    """Format RESTOCK alert with differences"""
+    code = get_option_code(product)
+    name = product.get("name", "Unknown")
+    price = product.get("offerPrice", {}).get("displayformattedValue", "N/A")
+    
+    # Calculate added stock
+    size_lines = ""
+    total_added = 0
+    
+    for size in sorted(set(list(old_sizes.keys()) + list(new_sizes.keys()))):
+        old_qty = old_sizes.get(size, 0)
+        new_qty = new_sizes.get(size, 0)
+        diff = new_qty - old_qty
+        
+        if diff > 0:
+            size_lines += f"  🟢 {size}: {new_qty} Unit(s)  +{diff} added\n"
+            total_added += diff
+        elif diff < 0:
+            size_lines += f"  🟡 {size}: {new_qty} Unit(s)  {diff} removed\n"
+        elif new_qty > 0:
+            size_lines += f"  ⚪ {size}: {new_qty} Unit(s)  (no change)\n"
+    
+    msg = f"📈 RESTOCK DETECTED [+{total_added}]\n\n"
+    msg += f"🏷️ {name}\n"
+    msg += f"🆔 Product ID: {code}\n\n"
+    msg += f"💰 Price: {price}\n\n"
+    msg += f"📊 Stock Changes:\n"
+    msg += size_lines
+    msg += f"🔗 {BASE_URL}/p/{code}\n\n"
+    msg += f"@CoBra_SR"
+    
+    return msg
+
+def format_back_in_stock_alert(product: dict, new_sizes: dict) -> str:
+    """Format BACK IN STOCK alert"""
+    code = get_option_code(product)
+    name = product.get("name", "Unknown")
+    price = product.get("offerPrice", {}).get("displayformattedValue", "N/A")
+    
+    size_lines = ""
+    total_units = 0
+    for size in sorted(new_sizes.keys()):
+        count = new_sizes[size]
+        total_units += count
+        size_lines += f"  🟢 {size}: {count} Unit(s)\n"
+    
+    msg = f"✅ BACK IN STOCK!\n\n"
+    msg += f"🏷️ {name}\n"
+    msg += f"🆔 Product ID: {code}\n\n"
+    msg += f"💰 Price: {price}\n\n"
+    msg += f"📊 Available Sizes ({total_units} total):\n"
+    msg += size_lines
+    msg += f"🔗 {BASE_URL}/p/{code}\n\n"
+    msg += f"@CoBra_SR"
+    
+    return msg
+
+def telegram_listener():
     offset = 0
     while True:
         try:
@@ -271,204 +368,50 @@ def telegram_listener():
                     continue
                 
                 if text == "/help":
-                    help_msg = """👋 <b>SHEIN Men's Monitor Bot</b>
+                    help_text = """<b>📋 SHEIN Monitor Commands</b>
 
-<b>🤖 Auto-alerts for:</b>
-  🚨 New products (in stock)
-  🔄 Restocked products
-  📈 Stock increases
+<b>Size Filters:</b>
+/filter M L - Alert only if M or L in stock
+/filterout 38 - Block alerts with only 38
+/rfilter - Clear size filters
 
-━━━━━━━━━━━━━━━━━━
-<b>📦 Manual Scan:</b>
+<b>Price Filters:</b>
+/filterprice 600 - Max price ₹600
+/flrange 100 300 - Price range ₹100-300
+/rflrange - Clear price filters
 
-/check_existing — scan all products
-/chex M L 38 — scan by size
+<b>Status:</b>
+/stats - Show monitor statistics
+/flstat - Show active filters
 
-━━━━━━━━━━━━━━━━━━
-<b>📐 Size Filters:</b>
-
-/filter M L — Alert ONLY these sizes
-/filterout 38 — Hide these sizes
-/rfilter — clear all filters
-/rfilter M — remove only M
-
-━━━━━━━━━━━━━━━━━━
-<b>💰 Price Filters:</b>
-
-/filterprice 600 — max price
-/flrange 100 300 — price range
-/rflprice — clear price
-
-━━━━━━━━━━━━━━━━━━
-<b>📊 Status:</b>
-
-/chstat — live stock count
-/flstat — active filters
-
-@CoBra_SR"""
-                    send_telegram(help_msg)
-                
-                elif text == "/check_existing":
-                    send_telegram("🔍 Scanning all products...")
-                    
-                    with all_products_lock:
-                        total = len(all_products_map)
-                        in_stock_count = 0
-                        
-                        if total > 0:
-                            send_telegram(f"📊 Found {total} total products - Checking stock...")
-                            
-                            for code, product in list(all_products_map.items()):
-                                sizes = fetch_pdp_with_curl(code)
-                                if sizes:
-                                    in_stock_count += 1
-                                    
-                                    name = product.get("name", code)[:70]
-                                    actual_price = product.get("price", {})
-                                    if isinstance(actual_price, dict):
-                                        price_str = actual_price.get("displayformattedValue", "N/A")
-                                    else:
-                                        price_str = f"Rs.{actual_price}"
-                                    
-                                    product_id = get_product_id(product)
-                                    
-                                    size_lines = ""
-                                    total_units = 0
-                                    for size in sorted(sizes.keys()):
-                                        count = sizes[size]
-                                        total_units += count
-                                        icon = get_stock_icon(count)
-                                        size_lines += f"  {icon} {size}: {count} Unit(s)\n"
-                                    
-                                    alert = f"""✅ IN STOCK
-
-🏷️ {name}
-🆔 Product ID: {product_id}
-
-💰 Price: {price_str}
-
-📊 Size Availability (Total: {total_units}):
-{size_lines}
-🔗 {BASE_URL}/p/{code}
-
-@CoBra_SR"""
-                                    
-                                    send_telegram(alert)
-                                    time.sleep(0.5)  # Small delay to avoid rate limiting
-                            
-                            summary = f"""📊 <b>Stock Scan Complete</b>
-
-Total Products: {total}
-✅ In Stock: {in_stock_count}
-❌ Out of Stock: {total - in_stock_count}"""
-                            
-                            send_telegram(summary)
-                        else:
-                            send_telegram("❌ No products found in catalog")
-                
-                elif text.startswith("/chex "):
-                    size_filter = set(text.replace("/chex ", "").split())
-                    send_telegram(f"🔍 Scanning for sizes: {', '.join(size_filter)}...")
-                    
-                    matches = []
-                    with all_products_lock:
-                        for code, product in all_products_map.items():
-                            sizes = fetch_pdp_with_curl(code)
-                            if sizes and (set(sizes.keys()) & size_filter):
-                                matches.append((code, product, sizes))
-                    
-                    if matches:
-                        send_telegram(f"✅ <b>Found {len(matches)} products - Sending individually...</b>")
-                        
-                        # Send each product as an individual message
-                        for code, product, sizes in matches:
-                            name = product.get("name", code)[:70]  # Slightly longer name
-                            actual_price = product.get("price", {})
-                            if isinstance(actual_price, dict):
-                                price_str = actual_price.get("displayformattedValue", "N/A")
-                            else:
-                                price_str = f"Rs.{actual_price}"
-                            
-                            # Get clean product ID
-                            product_id = get_product_id(product)
-                            
-                            # Format sizes for this product
-                            size_lines = ""
-                            for size in sorted(sizes.keys()):
-                                if size in size_filter:  # Only show matching sizes if filter is active
-                                    count = sizes[size]
-                                    icon = get_stock_icon(count)
-                                    size_lines += f"  {icon} {size}: {count} Unit(s)\n"
-                            
-                            # If no specific filter, show all sizes
-                            if not size_lines:
-                                for size in sorted(sizes.keys()):
-                                    count = sizes[size]
-                                    icon = get_stock_icon(count)
-                                    size_lines += f"  {icon} {size}: {count} Unit(s)\n"
-                            
-                            alert = f"""🚨 PRODUCT FOUND
-
-🏷️ {name}
-🆔 Product ID: {product_id}
-
-💰 Price: {price_str}
-
-📊 Size Availability:
-{size_lines}
-🔗 {BASE_URL}/p/{code}
-
-@CoBra_SR"""
-                            
-                            send_telegram(alert)
-                            time.sleep(0.5)  # Small delay to avoid rate limiting
-                    else:
-                        send_telegram(f"❌ No products found with sizes: {', '.join(size_filter)}")
+<b>Examples:</b>
+/filter M L XL - Alert if any of these sizes
+/filterprice 500 - Only alert products ≤₹500
+"""
+                    send_telegram(help_text)
                 
                 elif text.startswith("/filter "):
                     sizes = set(text.replace("/filter ", "").split())
                     with filter_lock:
                         filter_sizes.clear()
                         filter_sizes.update(sizes)
-                    send_telegram(f"✅ <b>Size Filter Set</b>\n\nAlert ONLY if: <code>{', '.join(sorted(sizes))}</code>")
+                    send_telegram(f"✅ <b>Size Filter Set</b>\nAlert only if: <code>{', '.join(sorted(sizes))}</code>")
                 
                 elif text.startswith("/filterout "):
                     sizes = set(text.replace("/filterout ", "").split())
                     with filter_lock:
                         filterout_sizes.clear()
                         filterout_sizes.update(sizes)
-                    send_telegram(f"✅ <b>Exclude Filter Set</b>\n\nHide if only: <code>{', '.join(sorted(sizes))}</code>")
-                
-                elif text == "/rfilter":
-                    with filter_lock:
-                        filter_sizes.clear()
-                    send_telegram("✅ Size filters cleared")
-                
-                elif text.startswith("/rfilter "):
-                    to_remove = set(text.replace("/rfilter ", "").split())
-                    with filter_lock:
-                        filter_sizes.difference_update(to_remove)
-                    send_telegram(f"✅ Removed: {', '.join(to_remove)}\nRemaining: {', '.join(sorted(filter_sizes)) or 'None'}")
-                
-                elif text == "/rfilterout":
-                    with filter_lock:
-                        filterout_sizes.clear()
-                    send_telegram("✅ Exclude filters cleared")
-                
-                elif text.startswith("/rfilterout "):
-                    to_remove = set(text.replace("/rfilterout ", "").split())
-                    with filter_lock:
-                        filterout_sizes.difference_update(to_remove)
-                    send_telegram(f"✅ Removed: {', '.join(to_remove)}\nRemaining: {', '.join(sorted(filterout_sizes)) or 'None'}")
+                    send_telegram(f"✅ <b>Exclude Filter Set</b>\nHide alerts with only: <code>{', '.join(sorted(sizes))}</code>")
                 
                 elif text.startswith("/filterprice "):
                     try:
                         price = int(text.replace("/filterprice ", ""))
                         with filter_lock:
                             filter_price_max = price
-                        send_telegram(f"✅ <b>Price Filter Set</b>\n\nMax price: ₹{price}")
+                        send_telegram(f"✅ <b>Price Filter Set</b>\nMax price: ₹{price}")
                     except:
-                        send_telegram("❌ Use: /filterprice 600")
+                        send_telegram("❌ Invalid price. Use: /filterprice 500")
                 
                 elif text.startswith("/flrange "):
                     try:
@@ -476,38 +419,39 @@ Total Products: {total}
                         min_p, max_p = int(parts[0]), int(parts[1])
                         with filter_lock:
                             filter_price_range = (min_p, max_p)
-                        send_telegram(f"✅ <b>Price Range Set</b>\n\n₹{min_p} - ₹{max_p}")
+                        send_telegram(f"✅ <b>Price Range Set</b>\n₹{min_p} - ₹{max_p}")
                     except:
-                        send_telegram("❌ Use: /flrange 100 300")
+                        send_telegram("❌ Use: /flrange 100 500")
                 
-                elif text == "/rflprice":
+                elif text == "/rfilter":
                     with filter_lock:
-                        filter_price_max = None
-                        filter_price_range = None
-                    send_telegram("✅ Price filters cleared")
+                        filter_sizes.clear()
+                        filterout_sizes.clear()
+                    send_telegram("✅ Size filters cleared")
                 
-                elif text == "/chstat":
-                    with all_products_lock:
-                        total = len(all_products_map)
-                    with stock_history_lock:
-                        in_stock = len([s for s in stock_history.values() if s])
-                    
-                    send_telegram(f"""📊 <b>Live Stock Count</b>
+                elif text == "/rflrange":
+                    with filter_lock:
+                        filter_price_range = None
+                    send_telegram("✅ Price range cleared")
+                
+                elif text == "/stats":
+                    with stats_lock:
+                        msg = f"""📊 <b>Monitor Statistics</b>
 
-Total Products: {total}
-✅ In Stock: {in_stock}
-❌ Out of Stock: {total - in_stock}
-
-Size icons:
-🔴 1–3 units
-🟡 4–10 units
-🟢 11+ units""")
+📋 Listing calls: <code>{stats['listing_calls']}</code>
+🔍 PDP calls: <code>{stats['pdp_calls']}</code>
+💾 Cache size: <code>{len(pdp_cache)}</code>
+🆕 New products: <code>{stats['new_products']}</code>
+📈 Restocks: <code>{stats['restocks']}</code>
+❌ Out of stock: <code>{stats['out_of_stock']}</code>
+🕐 Last check: <code>{stats['last_check']}</code>"""
+                    send_telegram(msg)
                 
                 elif text == "/flstat":
                     with filter_lock:
                         msg = f"""<b>📋 Active Filters</b>
 
-<b>Size Include:</b> {', '.join(sorted(filter_sizes)) or 'None (alert all)'}
+<b>Size Include:</b> {', '.join(sorted(filter_sizes)) or 'None (alert all in-stock)'}
 <b>Size Exclude:</b> {', '.join(sorted(filterout_sizes)) or 'None'}
 <b>Max Price:</b> ₹{filter_price_max or 'No limit'}
 <b>Price Range:</b> {filter_price_range or 'No range'}"""
@@ -519,8 +463,8 @@ Size icons:
 
 def main():
     print("="*70)
-    print("  SHEIN Monitor - Final Version")
-    print("  Actual Price | No Out-of-Stock | Clean IDs | Individual Messages")
+    print("  SHEIN Monitor - Final Improved Version")
+    print("  Proper Out-of-Stock Handling")
     print("="*70)
     
     start_health_server()
@@ -533,9 +477,6 @@ def main():
         print("❌ Failed. Exiting.")
         sys.exit(1)
     
-    with all_products_lock:
-        all_products_map.update({get_option_code(p): p for p in products})
-    
     current_codes = {get_option_code(p) for p in products}
     new_codes = current_codes - seen_codes
     
@@ -543,10 +484,12 @@ def main():
     print(f"🔄 Monitoring... (Ctrl+C to stop)\n")
     
     threading.Thread(target=telegram_listener, daemon=True).start()
-    send_telegram(f"""👋 <b>SHEIN Monitor Started</b>
+    send_telegram(f"""✅ <b>Monitor Started</b>
 
 👕 Products: {len(current_codes)}
 🆕 New: {len(new_codes)}
+📊 Smart PDP calls only for new products
+❌ Out of stock products will be marked
 
 💬 /help - See all commands
 @CoBra_SR""")
@@ -559,11 +502,11 @@ def main():
             time.sleep(CHECK_INTERVAL)
             continue
         
+        with stats_lock:
+            stats["last_check"] = datetime.now().strftime("%H:%M:%S")
+        
         current_map = {get_option_code(p): p for p in products}
         current_codes = set(current_map.keys())
-        
-        with all_products_lock:
-            all_products_map.update(current_map)
         
         brand_new = current_codes - seen_codes
         
@@ -575,54 +518,84 @@ def main():
             sizes = fetch_pdp_with_curl(code)
             print(f" ✓")
             
-            # Don't alert if out of stock
+            # Check if out of stock
             if not sizes:
-                print(f"  ❌ Out of stock - skipped")
+                with product_status_lock:
+                    product_status[code] = "out_of_stock"
+                with stats_lock:
+                    stats["out_of_stock"] += 1
+                
+                alert = format_new_alert(product, sizes)
+                send_telegram(alert)
+                print(f"  ⚠️ OUT OF STOCK - Alert sent!")
+                
+                with stock_history_lock:
+                    stock_history[code] = {}
+                
                 seen_codes.add(code)
                 continue
             
             # Check filters
             if not apply_size_filter(sizes) or not apply_price_filter(product):
                 print(f"  ⏭️ Filtered")
+                with product_status_lock:
+                    product_status[code] = "in_stock"
                 seen_codes.add(code)
                 continue
             
+            # In stock and passes filters
+            with product_status_lock:
+                product_status[code] = "in_stock"
             with stock_history_lock:
                 stock_history[code] = sizes.copy()
             
-            # Get ACTUAL price (not offer price)
-            actual_price = product.get("price", {})
-            if isinstance(actual_price, dict):
-                price_str = actual_price.get("displayformattedValue", "N/A")
-            else:
-                price_str = f"Rs.{actual_price}"
-            
-            # Get clean product ID (just the number)
-            product_id = get_product_id(product)
-            
-            # Format sizes without (X total)
-            size_lines = ""
-            for size in sorted(sizes.keys()):
-                count = sizes[size]
-                icon = get_stock_icon(count)
-                size_lines += f"  {icon} {size}: {count} Unit(s)\n"
-            
-            alert = f"""🚨 NEW PRODUCT [NEW]
-
-🏷️ {name}
-🆔 Product ID: {product_id}
-
-💰 Price: {price_str}
-
-📊 Size Availability:
-{size_lines}
-🔗 {BASE_URL}/p/{code}
-
-@CoBra_SR"""
-            
+            # Send alert
+            alert = format_new_alert(product, sizes)
             send_telegram(alert)
+            
             print(f"  ✅ Alert sent!")
+            
+            with stats_lock:
+                stats["new_products"] += 1
+            
             seen_codes.add(code)
+        
+        # Check for restocks/back in stock
+        for code in seen_codes:
+            if code in current_map and code in stock_history:
+                product = current_map[code]
+                new_sizes = fetch_pdp_with_curl(code)
+                old_sizes = stock_history[code]
+                old_status = product_status.get(code, "unknown")
+                
+                # Check status change: was out of stock, now in stock
+                if old_status == "out_of_stock" and new_sizes:
+                    if apply_size_filter(new_sizes) and apply_price_filter(product):
+                        alert = format_back_in_stock_alert(product, new_sizes)
+                        send_telegram(alert)
+                        
+                        with product_status_lock:
+                            product_status[code] = "in_stock"
+                        
+                        print(f"\n[{datetime.now():%H:%M:%S}] ✅ Back in stock: {product.get('name', code)[:50]}")
+                
+                # Check for stock increase in existing in-stock products
+                elif old_status == "in_stock" and new_sizes and new_sizes != old_sizes:
+                    total_old = sum(old_sizes.values())
+                    total_new = sum(new_sizes.values())
+                    
+                    if total_new > total_old:
+                        if apply_size_filter(new_sizes) and apply_price_filter(product):
+                            alert = format_restock_alert(product, old_sizes, new_sizes)
+                            send_telegram(alert)
+                            
+                            with stats_lock:
+                                stats["restocks"] += 1
+                            
+                            print(f"\n[{datetime.now():%H:%M:%S}] 📈 Restock: {product.get('name', code)[:50]}")
+                
+                with stock_history_lock:
+                    stock_history[code] = new_sizes.copy()
         
         seen_codes = seen_codes | current_codes
         
@@ -630,8 +603,10 @@ def main():
             save_state(seen_codes)
         
         elapsed = time.time() - loop_start
-        print(f"\r[{datetime.now():%H:%M:%S}] products={len(current_codes)} new={len(brand_new)} "
-              f"cache={len(pdp_cache)} {elapsed:.2f}s       ", end="", flush=True)
+        
+        with stats_lock:
+            print(f"\r[{datetime.now():%H:%M:%S}] products={len(current_codes)} new={len(brand_new)} "
+                  f"pdp={stats['pdp_calls']} oos={stats['out_of_stock']} {elapsed:.2f}s       ", end="", flush=True)
         
         sleep_remaining = CHECK_INTERVAL - elapsed
         if sleep_remaining > 0:
@@ -642,4 +617,4 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         print("\n\n👋 Stopped.")
-        send_telegram("🛑 Monitor Stopped\n@CoBra_SR")
+        send_telegram("🛑 <b>Monitor Stopped</b>\n@CoBra_SR")
