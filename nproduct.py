@@ -153,7 +153,7 @@ PDP_PARAMS = {
 }
 PDP_HEADERS = {
     "Accept": "application/json",
-    "User-Agent": "Android",
+    "User-Agent": "shein/6.9.0",
     "Client_type": "Android/32",
     "Client_version": "1.0.14",
     "X-Tenant-Id": "SHEIN",
@@ -170,7 +170,7 @@ CART_ID      = "96331ee6-ecc4-43f8-92fc-dbacf63d241b"
 CART_TOKEN   = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJjbGllbnQiLCJjbGllbnROYW1lIjoidHJ1c3RlZF9jbGllbnQiLCJyb2xlcyI6W3sibmFtZSI6IlJPTEVfVFJVU1RFRF9DTElFTlQifV0sInRlbmFudElkIjoiU0hFSU4iLCJleHAiOjE3NzQzNzM4MDMsImlhdCI6MTc3MTc4MTgwM30.Dj1UvifYKjaFLh5b6YcWJ3Ad7mP6ooTZOVVaCkw3dc6BbnoyDlB6sjRWKF1_USwhH5wr5QJpDO2PM8j_OpDqzGR01LbRseL9wzHENkvnQXhlNfnjiuQIRUxwZ4QGNSfsD6wGfcek-LuYeTSVDO4mFbSzsr6KLV-e4PzEnXALa2EczZVc5CZvNVzgxveIeUZDgT-bf5ifuN3oMGO7PrzoVRb_7AcvwNcKL-0mArKidkEUimipN_Ypkd472NayOwY8M3Z7yneetdUKhGM9-sXlxtbLAKDt8dzPvz1btFypScEuRmsoK2epdFSbKShnljgdwkKBhIQiNuQFkP8pSBqMDQ"
 CART_HEADERS = {
     "Accept": "application/json",
-    "User-Agent": "Android",
+    "User-Agent": "shein/6.9.0",
     "Client_type": "Android/32",
     "Client_version": "1.0.14",
     "X-Tenant-Id": "SHEIN",
@@ -188,7 +188,7 @@ CART_PARAMS  = {
 # ── HEADERS ─────────────────────────────────────────────────────────────────────
 HEADERS = {
     "Accept": "application/json",
-    "User-Agent": "Android",
+    "User-Agent": "shein/6.9.0",
     "Client_type": "Android/32",
     "Client_version": "1.0.14",
     "X-Tenant-Id": "SHEIN",
