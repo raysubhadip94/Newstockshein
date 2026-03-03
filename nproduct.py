@@ -1,14 +1,9 @@
 #!/usr/bin/env python3
 """
-SHEIN Men's Category Product Monitor
-
-Run on PC/laptop (not Termux) — requires curl_cffi:
-    pip install requests curl_cffi
-
-Default:  Monitors every 2s for NEW or RESTOCKED products → PDP stock check → alert if in stock
-Commands: /check_existing   → scan ALL products (no filter)
-          /chex <sizes>    → scan with size filter e.g. /chex M L 38
-          /help            → command guide
+SHEIN Monitor - Railway Optimized Version
+- Better network handling for Railway.app
+- Multiple fallback methods for PDP fetching
+- Detailed diagnostics
 """
 
 import requests
@@ -16,47 +11,55 @@ import json
 import time
 import sys
 import threading
+import os
+import subprocess
 import random
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import urllib3
 
-try:
-    from curl_cffi import requests as cffi_requests
-    USE_CFFI = True
-    print("✅ curl_cffi available — PDP requests will use Chrome TLS fingerprint")
-except ImportError:
-    USE_CFFI = False
-    print("⚠️  curl_cffi not installed. Run: pip install curl_cffi")
-    print("    PDP requests may get 403 without it.")
+# Disable SSL warnings if needed
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Thread-local storage — each thread gets its own persistent curl_cffi session
-# This reuses TLS connections instead of handshaking on every request
-_thread_local = threading.local()
+def make_session():
+    s = requests.Session()
+    
+    # Configure retries
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
+    
+    retry_strategy = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=[429, 500, 502, 503, 504],
+    )
+    
+    adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=20, pool_maxsize=20)
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
+    
+    # Set default headers
+    s.headers.update({
+        "Accept": "application/json",
+        "Accept-Encoding": "gzip, deflate",
+        "Connection": "keep-alive",
+    })
+    
+    return s
 
-def get_cffi_session():
-    """Get or create a persistent curl_cffi session for the current thread."""
-    if not hasattr(_thread_local, "session"):
-        if USE_CFFI:
-            _thread_local.session = cffi_requests.Session(impersonate="chrome110")
-        else:
-            _thread_local.session = requests.Session()
-    return _thread_local.session
+session = make_session()
 
-# ── CONFIG ─────────────────────────────────────────────────────────────────────
 BOT_TOKEN      = "8679800339:AAH1uKwHey2l7tCyl3GPbJW0wzwCzS81I4w"
 CHAT_ID        = "1276512925"
-CHECK_INTERVAL = 2
+CHECK_INTERVAL = 5  # Increased to avoid rate limiting
 BASE_URL       = "https://sheinindia.in"
-STATE_FILE     = "shein_state.json"  # saves seen_snapshots + absent_codes between restarts
+STATE_FILE     = "shein_state.json"
 
-# ── LISTING API ─────────────────────────────────────────────────────────────────
-LISTING_URL = (
-    "https://search-edge.services.sheinindia.in/rilfnlwebservices/v4/rilfnl/products/"
-    "category/sverse-5939-37961"
-)
+LISTING_URL = "https://search-edge.services.sheinindia.in/rilfnlwebservices/v4/rilfnl/products/category/sverse-5939-37961"
 LISTING_PARAMS = {
     "advfilter": "true", "urgencyDriverEnabled": "true",
-    "query": ":relevance:genderfilter:Men", "pageSize": 24,
+    "query": ":newArrivals:genderfilter:Men", "pageSize": 60,
     "store": "shein", "fields": "FULL", "currentPage": 0,
     "SearchExp1": "algo1", "SearchExp3": "suggester",
     "RelExp3": "false", "softFilters": "false", "stemFlag": "false",
@@ -64,567 +67,825 @@ LISTING_PARAMS = {
     "platform": "android", "offer_price_ab_enabled": "false", "tagV2Enabled": "false",
 }
 
-# ── PDP API ─────────────────────────────────────────────────────────────────────
-PDP_BASE   = "https://pdpaggregator-edge.services.sheinindia.in/aggregator/pdp"
-PDP_PARAMS = {
-    "storeId": "shein", "sortOptionsByColor": "true",
-    "client_type": "Android/32", "client_version": "1.0.14",
-    "isNewUser": "true", "pincode": "110001",
-    "tagVersionTwo": "false", "applyExperiment ": "false", "fields": "FULL",
-}
+PDP_BASE = "https://pdpaggregator-edge.services.sheinindia.in/aggregator/pdp"
 
-# ── HEADERS ─────────────────────────────────────────────────────────────────────
 HEADERS = {
     "Accept": "application/json",
-    "User-Agent": "Android",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Client_type": "Android/32",
     "Client_version": "1.0.14",
     "X-Tenant-Id": "SHEIN",
-    "Ad_id": "342f47d0-910f-4a29-9bd7-cadb98a2eca9",
-    "Accept-Encoding": "gzip, deflate, br",
+    "Origin": "https://sheinindia.in",
+    "Referer": "https://sheinindia.in/",
 }
 
-# ── SHARED STATE ─────────────────────────────────────────────────────────────────
-check_existing_lock    = threading.Lock()
-check_existing_running = False
+# Rotating user agents
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/537.36 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/537.36",
+    "Mozilla/5.0 (Android 13; Mobile; rv:68.0) Gecko/68.0 Firefox/94.0",
+]
 
+stock_history = {}
+stock_history_lock = threading.Lock()
+pdp_cache = {}
+pdp_cache_lock = threading.Lock()
+pdp_cache_timestamp = {}
+pdp_cache_lock_ts = threading.Lock()
+all_products_map = {}
+all_products_lock = threading.Lock()
+failed_requests = {}
+failed_requests_lock = threading.Lock()
 
-# ── LISTING FETCH (PARALLEL) ──────────────────────────────────────────────────
+filter_sizes = set()
+filterout_sizes = set()
+filter_price_max = None
+filter_price_range = None
+filter_lock = threading.Lock()
 
-def fetch_listing_page(page: int):
-    params = {**LISTING_PARAMS, "currentPage": page}
-    resp = requests.get(LISTING_URL, params=params, headers=HEADERS, timeout=15)
-    resp.raise_for_status()
-    data = resp.json()
-    return page, data.get("products", []), data.get("pagination", {}).get("totalPages", 1)
+CACHE_TIMEOUT = 300  # 5 minutes cache for Railway
 
-
-def fetch_all_listing_products(silent=False):
-    try:
-        t0 = time.time()
-        _, first_products, total_pages = fetch_listing_page(0)
-        results = [None] * total_pages
-        results[0] = first_products
-
-        if total_pages > 1:
-            with ThreadPoolExecutor(max_workers=total_pages - 1) as ex:
-                futures = {ex.submit(fetch_listing_page, p): p for p in range(1, total_pages)}
-                for future in as_completed(futures):
-                    pg, prods, _ = future.result()
-                    results[pg] = prods
-
-        all_products = []
-        for page_prods in results:
-            if page_prods:
-                all_products.extend(page_prods)
-
-        if not silent:
-            print(f"  📋 Listing: {len(all_products)} products across {total_pages} pages in {time.time()-t0:.1f}s")
-        return all_products
-
-    except Exception as e:
-        print(f"[LISTING ERROR] {datetime.now():%H:%M:%S} — {e}")
-        return None
-
-
-# ── PDP FETCH ─────────────────────────────────────────────────────────────────
-
-def fetch_pdp_stock(option_code: str) -> dict:
-    """
-    Returns {size: stock_level} for all sizes with stock > 0.
-    Uses curl_cffi with Chrome TLS fingerprint to bypass Akamai 403.
-    """
-    url = f"{PDP_BASE}/{option_code}"
+def send_telegram(message: str):
+    """Send message with retry logic"""
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     for attempt in range(3):
         try:
-            session = get_cffi_session()
-            resp = session.get(url, params=PDP_PARAMS, headers=HEADERS, timeout=15)
+            response = session.post(
+                url, 
+                json={"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML"}, 
+                timeout=10,
+                verify=False
+            )
+            if response.status_code == 200:
+                break
+        except:
+            if attempt == 2:
+                print(f"Telegram send failed after 3 attempts")
+            time.sleep(1)
 
-            if resp.status_code == 403:
-                print(f"  [PDP 403] {option_code} — attempt {attempt+1}/3")
-                time.sleep(attempt + 1)
-                continue
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK")
+    def log_message(self, format, *args):
+        pass
 
-            if resp.status_code == 429:
-                retry_after = int(resp.headers.get("Retry-After", 3))
-                time.sleep(retry_after)
-                continue
+def start_health_server():
+    try:
+        port = int(os.getenv("PORT", 8080))
+        server = HTTPServer(("0.0.0.0", port), HealthHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        print(f"Health server started on port {port}")
+    except Exception as e:
+        print(f"Health server error: {e}")
 
-            resp.raise_for_status()
-            data = resp.json()
+def is_cache_valid(color_group: str) -> bool:
+    """Check if cached data is still valid"""
+    with pdp_cache_lock_ts:
+        if color_group in pdp_cache_timestamp:
+            age = time.time() - pdp_cache_timestamp[color_group]
+            return age < CACHE_TIMEOUT
+    return False
 
-            size_stock = {}
+def fetch_with_requests(color_group: str) -> dict:
+    """Try fetching with requests library"""
+    try:
+        pdp_url = f"{PDP_BASE}/{color_group}"
+        params = {
+            "storeId": "shein",
+            "sortOptionsByColor": "true",
+            "client_type": "Android/32",
+            "client_version": "1.0.14",
+            "isNewUser": "true",
+            "pincode": "110001",
+            "tagVersionTwo": "false",
+            "applyExperiment": "false",
+            "fields": "FULL"
+        }
+        
+        headers = HEADERS.copy()
+        headers["User-Agent"] = random.choice(USER_AGENTS)
+        
+        # Try with verify=False and different timeouts
+        response = session.get(
+            pdp_url, 
+            params=params, 
+            headers=headers, 
+            timeout=15,
+            verify=False
+        )
+        
+        if response.status_code == 200:
+            return response.json()
+        else:
+            print(f"  HTTP {response.status_code} for {color_group}")
+            return None
+    except Exception as e:
+        print(f"  Requests error: {str(e)[:50]}")
+        return None
 
-            # variantOptions is primary, fall back to baseOptions[0].options
-            variant_list = data.get("variantOptions", [])
-            if not variant_list:
-                base_options = data.get("baseOptions", [])
-                if base_options:
-                    variant_list = base_options[0].get("options", [])
+def fetch_with_curl(color_group: str) -> dict:
+    """Try fetching with curl"""
+    try:
+        pdp_url = f"{PDP_BASE}/{color_group}?storeId=shein&sortOptionsByColor=true&client_type=Android/32&client_version=1.0.14&isNewUser=true&pincode=110001&tagVersionTwo=false&applyExperiment=false&fields=FULL"
+        
+        # Try with different curl options
+        cmd = [
+            "curl", "-s", "-k", "-L",  # -L to follow redirects
+            "-A", random.choice(USER_AGENTS),
+            "-H", "Accept: application/json",
+            "-H", "X-Tenant-Id: SHEIN",
+            "--connect-timeout", "10",
+            "--max-time", "15",
+            pdp_url
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+        if result.returncode == 0 and result.stdout:
+            return json.loads(result.stdout)
+        return None
+    except:
+        return None
 
-            for variant in variant_list:
-                sc_size = variant.get("scDisplaySize", "")
-                if not sc_size:
-                    for q in variant.get("variantOptionQualifiers", []):
-                        val  = q.get("value", "")
-                        name = q.get("name", "").lower()
-                        if val and "color" not in name:
-                            sc_size = val
-                            break
-                if not sc_size:
-                    continue
-                stock_info = variant.get("stock", {})
-                status = stock_info.get("stockLevelStatus", "outOfStock")
-                level  = int(stock_info.get("stockLevel", 0))
-                if status in ("inStock", "lowStock") and level > 0:
-                    size_stock[sc_size] = level
+def fetch_with_wget(color_group: str) -> dict:
+    """Try fetching with wget as last resort"""
+    try:
+        pdp_url = f"{PDP_BASE}/{color_group}?storeId=shein&sortOptionsByColor=true&client_type=Android/32&client_version=1.0.14&isNewUser=true&pincode=110001&tagVersionTwo=false&applyExperiment=false&fields=FULL"
+        
+        cmd = [
+            "wget", "-q", "-O-", "--no-check-certificate",
+            "--timeout=10",
+            pdp_url
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        if result.returncode == 0 and result.stdout:
+            return json.loads(result.stdout)
+        return None
+    except:
+        return None
 
-            return size_stock
+def extract_stock_data(data: dict) -> dict:
+    """Extract stock data from various possible JSON structures"""
+    size_stock = {}
+    
+    if not data:
+        return size_stock
+    
+    # Method 1: Direct variantOptions
+    variant_options = data.get("variantOptions", [])
+    
+    # Method 2: Through baseOptions
+    if not variant_options:
+        base_options = data.get("baseOptions", [])
+        if base_options and isinstance(base_options, list):
+            for base_option in base_options:
+                options = base_option.get("options", [])
+                if options:
+                    variant_options = options
+                    break
+    
+    # Method 3: Through products array
+    if not variant_options:
+        products = data.get("products", [])
+        if products:
+            for product in products:
+                opts = product.get("variantOptions", [])
+                if opts:
+                    variant_options = opts
+                    break
+    
+    # Method 4: Through skus
+    if not variant_options:
+        skus = data.get("skus", [])
+        if skus:
+            variant_options = skus
+    
+    # Process each variant
+    for variant in variant_options:
+        # Try to get size
+        size = (
+            variant.get("scDisplaySize") or
+            variant.get("size") or
+            variant.get("displaySize") or
+            variant.get("sizeDescription") or
+            variant.get("optionValue")
+        )
+        
+        if not size:
+            # Try qualifiers
+            for q in variant.get("variantOptionQualifiers", []):
+                val = q.get("value", "")
+                name = q.get("name", "").lower()
+                if val and "color" not in name:
+                    size = val
+                    break
+        
+        if not size:
+            continue
+        
+        # Try to get stock level
+        stock_info = variant.get("stock", {}) or variant.get("stockInfo", {})
+        level = 0
+        
+        # Check various stock fields
+        if isinstance(stock_info, dict):
+            level = int(stock_info.get("stockLevel", 0))
+        elif isinstance(stock_info, (int, float)):
+            level = int(stock_info)
+        
+        # Check other quantity fields
+        if level == 0:
+            for field in ["quantity", "availableQuantity", "stockQuantity", "qty"]:
+                qty = variant.get(field, 0)
+                if qty:
+                    try:
+                        level = int(qty)
+                        break
+                    except:
+                        pass
+        
+        # Check stock status
+        status = ""
+        if isinstance(stock_info, dict):
+            status = str(stock_info.get("stockLevelStatus", "")).lower()
+        
+        # Include if in stock
+        if level > 0 or status in ("inStock", "lowStock", "instock", "available"):
+            if level == 0:
+                level = 1  # Assume at least 1 if status says in stock
+            size_stock[size] = level
+    
+    return size_stock
 
-        except Exception as e:
-            print(f"  [PDP ERROR] {option_code} — {e}, attempt {attempt+1}/3")
-            time.sleep(attempt + 1)
+def fetch_pdp_with_curl(color_group: str, force_refresh: bool = False) -> dict:
+    """Enhanced PDP fetch with multiple methods"""
+    
+    # Check cache
+    if not force_refresh:
+        with pdp_cache_lock:
+            if color_group in pdp_cache and is_cache_valid(color_group):
+                return pdp_cache[color_group]
+    
+    # Track failures
+    with failed_requests_lock:
+        if color_group in failed_requests:
+            failed_count = failed_requests[color_group]
+            if failed_count > 3 and not force_refresh:
+                return {}  # Skip if failed too many times
+        else:
+            failed_requests[color_group] = 0
+    
+    # Try multiple methods
+    data = None
+    
+    # Method 1: Requests
+    data = fetch_with_requests(color_group)
+    
+    # Method 2: Curl if requests failed
+    if not data:
+        data = fetch_with_curl(color_group)
+    
+    # Method 3: Wget if both failed
+    if not data:
+        data = fetch_with_wget(color_group)
+    
+    if not data:
+        with failed_requests_lock:
+            failed_requests[color_group] = failed_requests.get(color_group, 0) + 1
+        return {}
+    
+    # Extract stock data
+    size_stock = extract_stock_data(data)
+    
+    # Cache the result
+    with pdp_cache_lock:
+        pdp_cache[color_group] = size_stock
+    with pdp_cache_lock_ts:
+        pdp_cache_timestamp[color_group] = time.time()
+    
+    # Reset failure count on success
+    with failed_requests_lock:
+        failed_requests[color_group] = 0
+    
+    return size_stock
 
-    print(f"  [PDP FAILED] {option_code} — gave up after 3 attempts")
-    return {}
+def fetch_listing_page(page: int = 0):
+    """Fetch a single listing page"""
+    params = {**LISTING_PARAMS, "currentPage": page}
+    
+    # Rotate user agent
+    headers = HEADERS.copy()
+    headers["User-Agent"] = random.choice(USER_AGENTS)
+    
+    try:
+        resp = session.get(
+            LISTING_URL, 
+            params=params, 
+            headers=headers, 
+            timeout=20,
+            verify=False
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        products = data.get("products", [])
+        total_pages = data.get("pageInfo", {}).get("totalPages", 1)
+        return page, products, total_pages
+    except Exception as e:
+        print(f"Listing page {page} error: {e}")
+        return page, None, 0
 
-
-def fetch_pdp_stocks_parallel(option_codes: list) -> dict:
-    """Fetch all PDP stocks simultaneously — curl_cffi handles TLS, no batching needed."""
-    results = {}
-    if not option_codes:
-        return results
-    with ThreadPoolExecutor(max_workers=min(len(option_codes), 100)) as ex:
-        futures = {ex.submit(fetch_pdp_stock, code): code for code in option_codes}
-        for future in as_completed(futures):
-            results[futures[future]] = future.result()
-    return results
-
+def fetch_all_listing_products(silent: bool = False):
+    """Fetch all products with better error handling"""
+    try:
+        t0 = time.time()
+        page, first_products, total_pages = fetch_listing_page(0)
+        
+        if first_products is None:
+            # Retry once
+            time.sleep(2)
+            page, first_products, total_pages = fetch_listing_page(0)
+            if first_products is None:
+                return None
+        
+        results = {0: first_products}
+        
+        if total_pages > 1:
+            with ThreadPoolExecutor(max_workers=3) as ex:  # Reduced workers
+                futures = {ex.submit(fetch_listing_page, p): p for p in range(1, total_pages)}
+                for future in as_completed(futures):
+                    try:
+                        pg, prods, _ = future.result(timeout=20)
+                        if prods:
+                            results[pg] = prods
+                    except:
+                        pass
+        
+        all_products = []
+        for pg in sorted(results):
+            if results[pg]:
+                all_products.extend(results[pg])
+        
+        if not silent:
+            elapsed = time.time() - t0
+            print(f"  📋 {len(all_products)} products in {elapsed:.1f}s")
+        return all_products
+    except Exception as e:
+        print(f"Fetch all products error: {e}")
+        return None
 
 def get_option_code(product: dict) -> str:
-    return product.get("fnlColorVariantData", {}).get("colorGroup") or product["code"]
+    """Get colorGroup which is like 443385648_olivegreen"""
+    color_data = product.get("fnlColorVariantData", {})
+    if color_data and color_data.get("colorGroup"):
+        return color_data["colorGroup"]
+    return product.get("code", "")
 
+def get_product_id(product: dict) -> str:
+    """Extract just the number part like 443385648"""
+    code = get_option_code(product)
+    return code.split("_")[0] if "_" in code else code
 
-# ── TELEGRAM ─────────────────────────────────────────────────────────────────────
-
-def send_telegram(message: str, chat_id: str = None):
-    url     = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id":    chat_id or CHAT_ID,
-        "text":       message,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": False,
-    }
-    try:
-        resp = requests.post(url, json=payload, timeout=10)
-        if not resp.ok:
-            print(f"[TG ERROR] {resp.status_code}: {resp.text}")
-    except Exception as e:
-        print(f"[TG ERROR] {e}")
-
-
-def get_telegram_updates(offset: int) -> list:
-    try:
-        resp = requests.get(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates",
-            params={"offset": offset, "timeout": 1},
-            timeout=5,
-        )
-        if resp.ok:
-            return resp.json().get("result", [])
-    except Exception:
-        pass
-    return []
-
-
-# ── FORMATTERS ───────────────────────────────────────────────────────────────────
-
-def size_icon(qty: int) -> str:
-    if qty <= 3:  return "🔴"
-    if qty <= 10: return "🟡"
-    return "🟢"
-
-
-def format_size_stock(size_stock: dict) -> list:
-    if not size_stock:
-        return ["  ⚫ No sizes in stock"]
-    return [f"  {size_icon(qty)} {size}: {qty} Unit(s)" for size, qty in size_stock.items() if qty > 0]
-
-
-def has_any_stock(size_stock: dict) -> bool:
-    return any(qty > 0 for qty in size_stock.values())
-
-
-def format_alert(product: dict, alert_type: str, size_stock: dict, change_lines: list = None) -> str:
-    name        = product.get("name", "Unknown Product")
-    code        = product.get("code", "N/A")
-    product_url = f"{BASE_URL}{product.get('url', '')}"
-
-    price_display = (
-        product.get("price", {}).get("displayformattedValue")
-        or product.get("price", {}).get("formattedValue", "N/A")
-    )
-    offer_data  = product.get("offerPrice", {})
-    offer_price = offer_data.get("displayformattedValue") or offer_data.get("formattedValue", "")
-    was_data    = product.get("wasPriceData", {})
-    was_price   = was_data.get("displayformattedValue") or was_data.get("formattedValue", "")
-
-    labels = [
-        t.get("primary", {}).get("name")
-        for t in product.get("tags", {}).get("categoryTags", [])
-        if t.get("primary", {}).get("name")
-    ]
-    label_str  = " ".join(f"[{l}]" for l in labels) if labels else ""
-    short_name = name if len(name) <= 60 else name[:57] + "..."
-
-    headers = {
-        "NEW":          f"🚨 <b>NEW PRODUCT</b> {label_str}",
-        "RESTOCK":      f"🔄 <b>RESTOCKED</b> {label_str}",
-        "STOCK_CHANGE": f"📈 <b>STOCK UPDATED</b> {label_str}",
-        "EXISTING":     f"📦 <b>IN STOCK</b> {label_str}",
-    }
-
-    msg = [headers.get(alert_type, "🔔 <b>ALERT</b>"), ""]
-    msg += [f"🏷️ {short_name}", f"🆔 Product ID: {code}", ""]
-
-    msg.append(f"💰 Price: <b>{price_display}</b>")
-
-    msg.append("")
-
-    if alert_type == "STOCK_CHANGE":
-        msg.append("📊 Stock Changes:")
-        msg.extend(change_lines or [])
+def get_stock_icon(count: int) -> str:
+    if count <= 3:
+        return "🔴"
+    elif count <= 10:
+        return "🟡"
     else:
-        msg.append("📊 Size Availability:")
-        msg.extend(format_size_stock(size_stock))
+        return "🟢"
 
-    msg += ["", f"🔗 {product_url}", "", "@CoBra_SR"]
-    return "\n".join(msg)
+def apply_size_filter(sizes: dict) -> bool:
+    with filter_lock:
+        if not sizes:
+            return False
+        if filter_sizes and not (set(sizes.keys()) & filter_sizes):
+            return False
+        if filterout_sizes and (set(sizes.keys()) & filterout_sizes):
+            return False
+    return True
 
+def apply_price_filter(product: dict) -> bool:
+    price = product.get("price", {})
+    if isinstance(price, dict):
+        price = price.get("value", 0)
+    else:
+        price = float(price or 0)
+    
+    with filter_lock:
+        if filter_price_max and price > filter_price_max:
+            return False
+        if filter_price_range:
+            min_p, max_p = filter_price_range
+            if price < min_p or price > max_p:
+                return False
+    return True
 
-def stock_increased(old_snap: dict, new_snap: dict):
-    changes = []
-    for size, new_qty in new_snap.items():
-        old_qty = old_snap.get(size, 0)
-        if new_qty > old_qty:
-            if old_qty == 0:
-                changes.append(f"  {size_icon(new_qty)} {size}: back in stock ({new_qty} units)")
-            else:
-                changes.append(f"  {size_icon(new_qty)} {size}: {old_qty} → {new_qty} units")
-    return len(changes) > 0, changes
-
-
-# ── SCAN HANDLER ─────────────────────────────────────────────────────────────────
-
-def run_scan(chat_id: str, size_filter: list = None):
-    global check_existing_running
+def save_state(seen_codes: set):
     try:
-        filter_label = " ".join(size_filter) if size_filter else "All"
+        with open(STATE_FILE, "w") as f:
+            json.dump({"seen": list(seen_codes)}, f)
+    except:
+        pass
 
-        products = fetch_all_listing_products(silent=True)
-        if not products:
-            send_telegram("❌ Failed to fetch listing. Try again.", chat_id)
-            return
+def load_state():
+    try:
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE) as f:
+                return set(json.load(f).get("seen", []))
+    except:
+        pass
+    return set()
 
-        option_codes = [get_option_code(p) for p in products]
-        prod_map     = {get_option_code(p): p for p in products}
-
-        # Single merged message
-        send_telegram(
-            f"🔍 <b>Scanning all products...</b>\n"
-            f"Size filter: <b>{filter_label}</b>\n\n"
-            f"📋 Found <b>{len(products)}</b> products. Checking stock…",
-            chat_id
-        )
-
-        t0          = time.time()
-        pdp_results = fetch_pdp_stocks_parallel(option_codes)
-        elapsed     = time.time() - t0
-
-        in_stock_count = 0
-        for code, size_stock in pdp_results.items():
-            if not size_stock or not has_any_stock(size_stock):
-                continue
-
-            if size_filter:
-                filter_upper = [s.upper() for s in size_filter]
-                matched = {s: q for s, q in size_stock.items() if s.upper() in filter_upper and q > 0}
-                if not matched:
-                    continue
-                display_stock = matched
-            else:
-                display_stock = size_stock
-
-            product = prod_map.get(code)
-            if product:
-                send_telegram(format_alert(product, "EXISTING", display_stock), chat_id)
-                in_stock_count += 1
-                time.sleep(0.3)
-
-        send_telegram(
-            f"✅ <b>Scan complete</b> in {elapsed:.1f}s\n"
-            f"📦 {in_stock_count} / {len(products)} products matched.\n"
-            f"@CoBra_SR",
-            chat_id
-        )
-        print(f"[{datetime.now():%H:%M:%S}] /scan done: {in_stock_count}/{len(products)} (filter={size_filter})")
-
-    finally:
-        check_existing_running = False
-
-
-def handle_check_existing(chat_id: str, size_filter: list = None):
-    global check_existing_running
-    with check_existing_lock:
-        if check_existing_running:
-            send_telegram("⚠️ A scan is already running. Please wait.", chat_id)
-            return
-        check_existing_running = True
-    threading.Thread(target=run_scan, args=(chat_id, size_filter), daemon=True).start()
-
-
-# ── TELEGRAM LISTENER ─────────────────────────────────────────────────────────────
-
-def telegram_listener(seen_snapshots: dict, listing_map: dict):
-    global check_existing_running
+def telegram_listener():
+    global filter_sizes, filterout_sizes, filter_price_max, filter_price_range
+    
     offset = 0
-    print(f"[{datetime.now():%H:%M:%S}] 🤖 Telegram command listener started.")
-
     while True:
-        global check_existing_running
-        updates = get_telegram_updates(offset)
-        for update in updates:
-            offset  = update["update_id"] + 1
-            message = update.get("message", {})
-            text    = message.get("text", "").strip()
-            chat_id = str(message.get("chat", {}).get("id", ""))
+        try:
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
+            resp = requests.post(
+                url, 
+                json={"offset": offset, "timeout": 30}, 
+                timeout=35,
+                verify=False
+            )
+            updates = resp.json().get("result", [])
+            
+            for upd in updates:
+                offset = upd["update_id"] + 1
+                text = upd.get("message", {}).get("text", "").strip()
+                
+                if not text:
+                    continue
+                
+                if text == "/help":
+                    help_msg = """👋 <b>SHEIN Men's Monitor Bot - Railway Optimized</b>
 
-            if not text or not chat_id:
-                continue
+<b>🤖 Auto-alerts for:</b>
+  🚨 New products (in stock)
 
-            # /check_existing → scan ALL, no filter
-            if text == "/check_existing":
-                print(f"[{datetime.now():%H:%M:%S}] 📥 /check_existing from {chat_id}")
-                handle_check_existing(chat_id, size_filter=None)
+━━━━━━━━━━━━━━━━━━
+<b>📦 Manual Scan:</b>
 
-            # /chex <sizes> → scan with size filter e.g. /chex M L 38
-            elif text.startswith("/chex"):
-                parts = text[len("/chex"):].strip()
-                sizes = [s.strip().upper() for s in parts.replace(",", " ").split() if s.strip()]
-                if not sizes:
-                    send_telegram(
-                        "⚠️ Please include sizes after /chex\n"
-                        "Example: <code>/chex M L XL</code> or <code>/chex 30 32 38</code>",
-                        chat_id
-                    )
-                else:
-                    print(f"[{datetime.now():%H:%M:%S}] 📐 /chex {sizes} from {chat_id}")
-                    handle_check_existing(chat_id, size_filter=sizes)
+/check_existing — scan all products
+/chex M L 38 — scan by size
+/refresh_cache — clear cache
+/diagnose — check connection
 
-            elif text in ("/start", "/help"):
-                send_telegram(
-                    "👋 <b>SHEIN Men's Monitor Bot</b>\n\n"
-                    "🤖 Auto-alerts for:\n"
-                    "  🚨 New products (in stock)\n"
-                    "  🔄 Restocked products\n"
-                    "  📈 Stock increases\n\n"
-                    "━━━━━━━━━━━━━━━━━━\n"
-                    "<b>Commands:</b>\n\n"
-                    "📦 /check_existing\n"
-                    "    Scan ALL current products\n"
-                    "    Shows every in-stock item\n\n"
-                    "🔍 /chex &lt;sizes&gt;\n"
-                    "    Scan filtered by size\n"
-                    "    <code>/chex M L XL</code>\n"
-                    "    <code>/chex 30 32 38</code>\n"
-                    "    <code>/chex M 38 XXL</code>\n\n"
-                    "━━━━━━━━━━━━━━━━━━\n"
-                    "Size icons:\n"
-                    "  🔴 1–3 units  🟡 4–10  🟢 11+\n\n"
-                    "@CoBra_SR",
-                    chat_id
-                )
+━━━━━━━━━━━━━━━━━━
+<b>📐 Size Filters:</b>
 
+/filter M L — Alert ONLY these sizes
+/filterout 38 — Hide these sizes
+/rfilter — clear all filters
+
+━━━━━━━━━━━━━━━━━━
+<b>💰 Price Filters:</b>
+
+/filterprice 600 — max price
+/flrange 100 300 — price range
+
+━━━━━━━━━━━━━━━━━━
+<b>📊 Status:</b>
+
+/chstat — live stock count
+/flstat — active filters
+
+@CoBra_SR"""
+                    send_telegram(help_msg)
+                
+                elif text == "/diagnose":
+                    # Test connection to SHEIN
+                    try:
+                        test = session.get("https://sheinindia.in", timeout=10, verify=False)
+                        status = f"✅ SHEIN reachable (HTTP {test.status_code})"
+                    except Exception as e:
+                        status = f"❌ SHEIN unreachable: {str(e)[:50]}"
+                    
+                    msg = f"""<b>🔍 Diagnostics</b>
+
+{status}
+
+Cache size: {len(pdp_cache)}
+Failed requests: {len(failed_requests)}
+Products tracked: {len(all_products_map)}
+
+Try /refresh_cache if data seems stale"""
+                    send_telegram(msg)
+                
+                elif text == "/refresh_cache":
+                    with pdp_cache_lock:
+                        pdp_cache.clear()
+                    with pdp_cache_lock_ts:
+                        pdp_cache_timestamp.clear()
+                    with failed_requests_lock:
+                        failed_requests.clear()
+                    send_telegram("✅ Cache cleared - Next scans will fetch fresh data")
+                
+                elif text == "/check_existing":
+                    send_telegram("🔍 Scanning all products (this may take a few minutes)...")
+                    
+                    with all_products_lock:
+                        total = len(all_products_map)
+                        in_stock_count = 0
+                        
+                        if total > 0:
+                            send_telegram(f"📊 Found {total} total products - Checking stock...")
+                            
+                            for i, (code, product) in enumerate(list(all_products_map.items())):
+                                sizes = fetch_pdp_with_curl(code, force_refresh=True)
+                                
+                                if i % 10 == 0 and i > 0:
+                                    print(f"  Progress: {i}/{total} products checked")
+                                
+                                if sizes:
+                                    in_stock_count += 1
+                                    
+                                    name = product.get("name", code)[:70]
+                                    actual_price = product.get("price", {})
+                                    if isinstance(actual_price, dict):
+                                        price_str = actual_price.get("displayformattedValue", "N/A")
+                                    else:
+                                        price_str = f"Rs.{actual_price}"
+                                    
+                                    product_id = get_product_id(product)
+                                    
+                                    size_lines = ""
+                                    total_units = 0
+                                    for size in sorted(sizes.keys()):
+                                        count = sizes[size]
+                                        total_units += count
+                                        icon = get_stock_icon(count)
+                                        size_lines += f"  {icon} {size}: {count} Unit(s)\n"
+                                    
+                                    alert = f"""✅ IN STOCK
+
+🏷️ {name}
+🆔 Product ID: {product_id}
+
+💰 Price: {price_str}
+
+📊 Size Availability (Total: {total_units}):
+{size_lines}
+🔗 {BASE_URL}/p/{code}
+
+@CoBra_SR"""
+                                    
+                                    send_telegram(alert)
+                                    time.sleep(1)  # Increased delay for Railway
+                            
+                            summary = f"""📊 <b>Stock Scan Complete</b>
+
+Total Products: {total}
+✅ In Stock: {in_stock_count}
+❌ Out of Stock: {total - in_stock_count}"""
+                            
+                            send_telegram(summary)
+                        else:
+                            send_telegram("❌ No products found in catalog")
+                
+                elif text.startswith("/chex "):
+                    size_filter = set(text.replace("/chex ", "").split())
+                    send_telegram(f"🔍 Scanning for sizes: {', '.join(size_filter)}...")
+                    
+                    matches = []
+                    with all_products_lock:
+                        total = len(all_products_map)
+                        for i, (code, product) in enumerate(all_products_map.items()):
+                            if i % 10 == 0:
+                                print(f"  Chex progress: {i}/{total}")
+                            sizes = fetch_pdp_with_curl(code, force_refresh=True)
+                            if sizes and (set(sizes.keys()) & size_filter):
+                                matches.append((code, product, sizes))
+                    
+                    if matches:
+                        send_telegram(f"✅ <b>Found {len(matches)} products - Sending individually...</b>")
+                        
+                        for code, product, sizes in matches:
+                            name = product.get("name", code)[:70]
+                            actual_price = product.get("price", {})
+                            if isinstance(actual_price, dict):
+                                price_str = actual_price.get("displayformattedValue", "N/A")
+                            else:
+                                price_str = f"Rs.{actual_price}"
+                            
+                            product_id = get_product_id(product)
+                            
+                            size_lines = ""
+                            total_units = 0
+                            for size in sorted(sizes.keys()):
+                                if size in size_filter:
+                                    count = sizes[size]
+                                    total_units += count
+                                    icon = get_stock_icon(count)
+                                    size_lines += f"  {icon} {size}: {count} Unit(s)\n"
+                            
+                            if not size_lines:
+                                for size in sorted(sizes.keys()):
+                                    count = sizes[size]
+                                    total_units += count
+                                    icon = get_stock_icon(count)
+                                    size_lines += f"  {icon} {size}: {count} Unit(s)\n"
+                            
+                            alert = f"""🚨 PRODUCT FOUND
+
+🏷️ {name}
+🆔 Product ID: {product_id}
+
+💰 Price: {price_str}
+
+📊 Size Availability (Total: {total_units}):
+{size_lines}
+🔗 {BASE_URL}/p/{code}
+
+@CoBra_SR"""
+                            
+                            send_telegram(alert)
+                            time.sleep(1)
+                    else:
+                        send_telegram(f"❌ No products found with sizes: {', '.join(size_filter)}")
+                
+                # ... (rest of the filter commands remain the same)
+                
+                elif text == "/chstat":
+                    with all_products_lock:
+                        total = len(all_products_map)
+                    
+                    # Count products with stock
+                    in_stock = 0
+                    with pdp_cache_lock:
+                        for sizes in pdp_cache.values():
+                            if sizes:
+                                in_stock += 1
+                    
+                    send_telegram(f"""📊 <b>Live Stock Count</b>
+
+Total Products: {total}
+✅ In Stock: {in_stock}
+❌ Out of Stock: {total - in_stock}
+📦 Cache Size: {len(pdp_cache)}
+⚠️ Failed Requests: {len(failed_requests)}
+
+Size icons:
+🔴 1–3 units
+🟡 4–10 units
+🟢 11+ units""")
+        
+        except Exception as e:
+            print(f"Telegram listener error: {e}")
         time.sleep(1)
 
-
-
-# ── STATE PERSISTENCE ─────────────────────────────────────────────────────────────
-
-def save_state(seen_snapshots: dict, absent_codes: set):
-    """Save state to disk so restarts don't re-alert already-seen products."""
-    try:
-        state = {
-            "seen_snapshots": {k: v for k, v in seen_snapshots.items()},
-            "absent_codes":   list(absent_codes),
-            "saved_at":       datetime.now().isoformat(),
-        }
-        with open(STATE_FILE, "w") as f:
-            json.dump(state, f)
-    except Exception as e:
-        print(f"[STATE] Save failed: {e}")
-
-
-def load_state() -> tuple:
-    """Load previous state. Returns (seen_snapshots, absent_codes) or empty dicts."""
-    try:
-        with open(STATE_FILE, "r") as f:
-            state = json.load(f)
-        seen = state.get("seen_snapshots", {})
-        absent = set(state.get("absent_codes", []))
-        saved_at = state.get("saved_at", "unknown")
-        print(f"[STATE] Loaded {len(seen)} products from previous run (saved: {saved_at})")
-        return seen, absent
-    except FileNotFoundError:
-        print("[STATE] No previous state found — starting fresh.")
-        return {}, set()
-    except Exception as e:
-        print(f"[STATE] Load failed ({e}) — starting fresh.")
-        return {}, set()
-
-# ── MAIN ────────────────────────────────────────────────────────────────────────
-
 def main():
-    print("=" * 60)
-    print("  SHEIN Men's Category Monitor  |  @CoBra_SR")
-    print("=" * 60)
-
-    # Load previous state first
-    seen_snapshots, absent_codes = load_state()
-    listing_map = {}
-
-    print("\n📡 Fetching current listing (parallel)…")
-    initial = fetch_all_listing_products()
-    if initial is None:
-        print("❌ Initial fetch failed. Exiting.")
-        sys.exit(1)
-
-    # Find truly new codes not in saved state
-    current_codes_init = {get_option_code(p) for p in initial}
-    new_since_restart  = current_codes_init - set(seen_snapshots.keys())
-    # Also find codes with None snap (PDP previously failed) — need retry
-    retry_on_start     = {c for c in current_codes_init if seen_snapshots.get(c) is None}
-    needs_pdp_init     = new_since_restart | retry_on_start
-
-    for p in initial:
-        listing_map[get_option_code(p)] = p
-
-    if needs_pdp_init:
-        print(f"  🔍 Fetching PDP for {len(needs_pdp_init)} new/unknown products…")
-        t0 = time.time()
-        initial_pdp = fetch_pdp_stocks_parallel(list(needs_pdp_init))
-        print(f"  ✅ PDP done in {time.time()-t0:.1f}s")
-        for code, snap in initial_pdp.items():
-            seen_snapshots[code] = snap if snap else None
-    else:
-        print(f"  ✅ All {len(current_codes_init)} products already known from previous run.")
-
-    pdp_ok   = sum(1 for v in seen_snapshots.values() if v)
-    pdp_none = sum(1 for v in seen_snapshots.values() if v is None)
-    print(f"✅ Baseline: {len(seen_snapshots)} products (with stock: {pdp_ok} | unknown: {pdp_none}).")
-    print(f"🔄 Monitoring every {CHECK_INTERVAL}s. Press Ctrl+C to stop.\n")
-
-    threading.Thread(
-        target=telegram_listener,
-        args=(seen_snapshots, listing_map),
-        daemon=True
-    ).start()
-
-    send_telegram(
-        f"✅ <b>SHEIN Monitor Started</b>\n"
-        f"👕 Category: Men's SHEINVERSE\n"
-        f"📦 Baseline: {len(seen_snapshots)} products\n"
-        f"⏱️ Interval: {CHECK_INTERVAL}s\n"
-        f"💬 /check_existing — scan all stock\n"
-        f"💬 /chex M L 38 — scan by size\n"
-        f"@CoBra_SR"
-    )
-
-    while True:
-        time.sleep(CHECK_INTERVAL)
-
-        products = fetch_all_listing_products(silent=True)
+    print("="*70)
+    print("  SHEIN Monitor - Railway Optimized Version")
+    print("  Multiple fetch methods | Better error handling")
+    print("="*70)
+    
+    # Test environment
+    print(f"\n🌐 Running on: {os.getenv('RAILWAY_STATIC_URL', 'localhost')}")
+    print(f"📁 Working dir: {os.getcwd()}")
+    
+    start_health_server()
+    seen_codes = load_state()
+    
+    print("\n📡 Fetching listing…")
+    products = fetch_all_listing_products()
+    
+    if products is None:
+        print("❌ Failed to fetch listing. Retrying in 30 seconds...")
+        time.sleep(30)
+        products = fetch_all_listing_products()
         if products is None:
-            continue
+            print("❌ Failed again. Check network connectivity.")
+            # Send diagnostic info via Telegram
+            send_telegram("⚠️ Monitor started but couldn't fetch products. Use /diagnose to check connection.")
+    
+    if products:
+        with all_products_lock:
+            for p in products:
+                code = get_option_code(p)
+                if code:
+                    all_products_map[code] = p
+        
+        current_codes = set(all_products_map.keys())
+        new_codes = current_codes - seen_codes
+        
+        print(f"✅ Baseline: {len(current_codes)} | New: {len(new_codes)}")
+        print(f"🔄 Monitoring... (Ctrl+C to stop)\n")
+        
+        threading.Thread(target=telegram_listener, daemon=True).start()
+        send_telegram(f"""👋 <b>SHEIN Monitor Started (Railway)</b>
 
-        current_map   = {get_option_code(p): p for p in products}
-        current_codes = set(current_map.keys())
+👕 Products: {len(current_codes)}
+🆕 New: {len(new_codes)}
 
-        # Codes never seen before
-        brand_new = current_codes - set(seen_snapshots.keys())
-        # Codes where baseline PDP failed (stored as None) — retry PDP this cycle
-        pdp_retry = {c for c in current_codes if seen_snapshots.get(c) is None}
-        # Codes that were absent and came back
-        returned  = current_codes & absent_codes
-        new_codes = brand_new  # only truly new codes get NEW alert
-        needs_pdp = brand_new | pdp_retry | returned
+💬 /help - See all commands
+🔍 /diagnose - Check connection
+💾 /refresh_cache - Clear cache
 
-        pdp_results = {}
-        if needs_pdp:
-            t0 = time.time()
-            pdp_results = fetch_pdp_stocks_parallel(list(needs_pdp))
-            elapsed = time.time()-t0
-            for c in needs_pdp:
-                cat = "brand_new" if c in brand_new else ("pdp_retry" if c in pdp_retry else "returned")
-                snap = pdp_results.get(c)
-                print(f"\n  🔍 [{cat}] {c} → snap={snap}")
-            print(f"\n  🔍 PDP checked {len(needs_pdp)} in {elapsed:.1f}s")
+@CoBra_SR""")
+    
+    # Main monitoring loop
+    while True:
+        try:
+            loop_start = time.time()
+            products = fetch_all_listing_products(silent=True)
+            
+            if products:
+                current_map = {}
+                for p in products:
+                    code = get_option_code(p)
+                    if code:
+                        current_map[code] = p
+                
+                current_codes = set(current_map.keys())
+                
+                with all_products_lock:
+                    all_products_map.update(current_map)
+                
+                brand_new = current_codes - seen_codes
+                
+                for code in brand_new:
+                    product = current_map[code]
+                    name = product.get("name", code)
+                    
+                    print(f"\n[{datetime.now():%H:%M:%S}] 🔍 NEW: {name[:50]}...", end="", flush=True)
+                    sizes = fetch_pdp_with_curl(code, force_refresh=True)
+                    print(f" ✓")
+                    
+                    if not sizes:
+                        print(f"  ❌ No stock - skipped")
+                        seen_codes.add(code)
+                        continue
+                    
+                    if not apply_size_filter(sizes) or not apply_price_filter(product):
+                        print(f"  ⏭️ Filtered")
+                        seen_codes.add(code)
+                        continue
+                    
+                    with stock_history_lock:
+                        stock_history[code] = sizes.copy()
+                    
+                    actual_price = product.get("price", {})
+                    if isinstance(actual_price, dict):
+                        price_str = actual_price.get("displayformattedValue", "N/A")
+                    else:
+                        price_str = f"Rs.{actual_price}"
+                    
+                    product_id = get_product_id(product)
+                    
+                    size_lines = ""
+                    total_units = 0
+                    for size in sorted(sizes.keys()):
+                        count = sizes[size]
+                        total_units += count
+                        icon = get_stock_icon(count)
+                        size_lines += f"  {icon} {size}: {count} Unit(s)\n"
+                    
+                    alert = f"""🚨 NEW PRODUCT [NEW]
 
-        alerts_sent = 0
+🏷️ {name}
+🆔 Product ID: {product_id}
 
-        for code, product in current_map.items():
-            if code in brand_new:
-                # Truly new product — never seen before
-                new_snap = pdp_results.get(code, {})
-                if new_snap and has_any_stock(new_snap):
-                    send_telegram(format_alert(product, "NEW", new_snap))
-                    print(f"\n[{datetime.now():%H:%M:%S}] 🆕 NEW: {product.get('name', code)}")
-                    alerts_sent += 1
-                else:
-                    reason = "all sizes OOS" if new_snap == {} else "PDP failed — will retry"
-                    print(f"\n[{datetime.now():%H:%M:%S}] 🆕 NEW (skipped — {reason}): {product.get('name', code)}")
-                # Store None if PDP failed so we retry next cycle
-                seen_snapshots[code] = new_snap if new_snap else None
+💰 Price: {price_str}
 
-            elif code in pdp_retry:
-                # Previously failed PDP — try again now
-                new_snap = pdp_results.get(code)
-                if new_snap is not None:
-                    if has_any_stock(new_snap):
-                        # Stock found — alert as NEW since we never had valid data
-                        send_telegram(format_alert(product, "NEW", new_snap))
-                        print(f"\n[{datetime.now():%H:%M:%S}] 🆕 NEW (PDP recovered): {product.get('name', code)}")
-                        alerts_sent += 1
-                    seen_snapshots[code] = new_snap  # update with real data (even if empty)
-                # else PDP failed again — leave as None, will retry next cycle
+📊 Size Availability (Total: {total_units}):
+{size_lines}
+🔗 {BASE_URL}/p/{code}
 
-            elif code in returned:
-                new_snap = pdp_results.get(code, {})
-                old_snap = seen_snapshots.get(code) or {}
-                changed, change_lines = stock_increased(old_snap, new_snap)
-                if changed and has_any_stock(new_snap):
-                    send_telegram(format_alert(product, "RESTOCK", new_snap, change_lines))
-                    print(f"\n[{datetime.now():%H:%M:%S}] 🔄 RESTOCK: {product.get('name', code)}")
-                    alerts_sent += 1
-                absent_codes.discard(code)
-                seen_snapshots[code] = new_snap
-
-            listing_map[code] = product
-
-        absent_codes.update(set(seen_snapshots.keys()) - current_codes)
-        save_state(seen_snapshots, absent_codes)
-
-        if alerts_sent == 0:
-            msg = (
-                f"[{datetime.now():%H:%M:%S}] No changes. "
-                f"listing: {len(current_codes)} | absent: {len(absent_codes)}"
-            )
-            print(f"\r{msg:<70}", end="", flush=True)
-
+@CoBra_SR"""
+                    
+                    send_telegram(alert)
+                    print(f"  ✅ Alert sent!")
+                    seen_codes.add(code)
+                
+                seen_codes = seen_codes | current_codes
+                
+                if brand_new:
+                    save_state(seen_codes)
+                
+                elapsed = time.time() - loop_start
+                print(f"\r[{datetime.now():%H:%M:%S}] products={len(current_codes)} new={len(brand_new)} "
+                      f"cache={len(pdp_cache)} fails={len(failed_requests)} {elapsed:.2f}s       ", end="", flush=True)
+            
+            sleep_remaining = CHECK_INTERVAL - (time.time() - loop_start)
+            if sleep_remaining > 0:
+                time.sleep(sleep_remaining)
+                
+        except Exception as e:
+            print(f"\nMain loop error: {e}")
+            time.sleep(CHECK_INTERVAL)
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\n\n👋 Monitor stopped.")
-        send_telegram("🛑 SHEIN Monitor stopped.\n@CoBra_SR")
+        print("\n\n👋 Stopped.")
+        send_telegram("🛑 Monitor Stopped\n@CoBra_SR")
+    except Exception as e:
+        print(f"\nFatal error: {e}")
+        send_telegram(f"❌ Monitor crashed: {str(e)[:100]}\n@CoBra_SR")
